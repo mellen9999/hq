@@ -14,7 +14,7 @@ set -u
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
 [ -f "$CONF/hqrc" ] && . "$CONF/hqrc"
-: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_WIDTH:=46}" "${HQ_TICK:=2}"
+: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_WIDTH:=46}" "${HQ_TICK:=2}" "${HQ_NARROW:=100}"
 S="${HQ_SESSION:-hq}"
 X="${S}x"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hq"
@@ -53,6 +53,8 @@ binds() {  # root-table keys, live even while typing in a claude. if-shell
   if [ "${HQ_BINDS:-1}" != 1 ]; then
     for i in j k h l n Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
     tmux unbind -a -T hqnav 2>/dev/null
+    tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null
+    tmux bind Space next-layout   # restore stock prefix-Space
     return 0
   fi
   # M-j/M-k switch AND arm nav mode: follow-up bare j/k keep navigating,
@@ -60,6 +62,10 @@ binds() {  # root-table keys, live even while typing in a claude. if-shell
   tmux bind -n M-j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav"     "send-keys M-j"
   tmux bind -n M-k if -F "$g" "previous-window -t '$X:' ; switch-client -T hqnav" "send-keys M-k"
   tmux bind -n M-Space if -F "$g" 'switch-client -T hqnav' 'send-keys M-Space'
+  # prefix fallbacks for keyboards without alt (phones): C-b j/k/Space
+  tmux bind j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav" ''
+  tmux bind k if -F "$g" "previous-window -t '$X:' ; switch-client -T hqnav" ''
+  tmux bind Space if -F "$g" 'switch-client -T hqnav' 'next-layout'
   tmux bind -n M-h if -F "$g" 'select-pane -L'           "send-keys M-h"
   tmux bind -n M-l if -F "$g" 'select-pane -R'           "send-keys M-l"
   tmux bind -n M-n if -F "$g" "run-shell '$SELF newtab'" "send-keys M-n"
@@ -270,6 +276,24 @@ render() {
   printf '%s[H%s[2J%s\n' "$E" "$E" "$buf"
 }
 
+prev_narrow=0
+autozoom() {  # phone-sized clients get one full-screen pane at a time:
+  # below HQ_NARROW cols the active pane is kept zoomed (C-b o still flips —
+  # the other pane zooms as soon as it goes active). wide again → unzoom once.
+  local ww zf act
+  set -- $(tmux display -p -t "=$S:hq" '#{window_width} #{window_zoomed_flag} #{pane_id}' 2>/dev/null)
+  ww=${1:-} zf=${2:-} act=${3:-}
+  [ -n "$ww" ] || return 0
+  if (( ww < HQ_NARROW )); then
+    prev_narrow=1
+    [ "$zf" = 0 ] && tmux resize-pane -Z -t "$act" 2>/dev/null
+  else
+    (( prev_narrow )) && [ "$zf" = 1 ] && tmux resize-pane -Z -t "$act" 2>/dev/null
+    prev_narrow=0
+  fi
+  return 0
+}
+
 preview() { [ "${tkind[sel]:-}" = in ] && tmux select-window -t "${tid[sel]}" 2>/dev/null; return 0; }
 
 focus() {
@@ -277,6 +301,7 @@ focus() {
   if [ "${tkind[sel]:-}" = in ]; then
     tmux select-window -t "${tid[sel]}" 2>/dev/null
     tmux select-pane -t "$(rpane)" 2>/dev/null
+    autozoom
   elif [ "${tkind[sel]:-}" = ex ]; then
     c=$(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null | head -1)
     [ -n "$c" ] && tmux switch-client -c "$c" -t "${tid[sel]}" 2>/dev/null
@@ -335,6 +360,7 @@ board() {
   scan; render; last=$SECONDS
   while :; do
     tmux has-session -t "=$S" 2>/dev/null || { printf '\nhq session gone\n'; exit 1; }
+    autozoom
     if (( SECONDS - last >= HQ_TICK )); then
       [ "$(wc -l < "$CACHE")" -gt 200 ] && : > "$CACHE"
       scan; render; last=$SECONDS
@@ -356,6 +382,9 @@ case "${1:-}" in
   hooks) hooks ;;
   newtab) newtab ;;
   nth) nth "${2:-1}" ;;
+  restart)  # rebuild board + viewer; claudes (hqx) untouched
+    tmux kill-session -t "=$S" 2>/dev/null
+    exec "$SELF" ;;
   '')
     migrate
     ensure
@@ -374,5 +403,5 @@ case "${1:-}" in
     fi
     echo "hq: sessions ready (no tty — attach with: tmux attach -t $S)"
     ;;
-  *) echo 'usage: hq [board|view|hooks|newtab|nth N]' >&2; exit 2 ;;
+  *) echo 'usage: hq [restart|board|view|hooks|newtab|nth N]' >&2; exit 2 ;;
 esac

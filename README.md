@@ -65,8 +65,27 @@ q         detach
 ?         help
 ```
 
-`HQ_BINDS=0` in hqrc removes the alt keys. `C-b C-b` reaches the inner
+no alt on your keyboard (phones)? prefix works everywhere: `C-b j` /
+`C-b k` switch tabs and arm nav mode, `C-b Space` arms it in place —
+then bare `j k g G 1-9` as usual.
+
+`HQ_BINDS=0` in hqrc removes all of it. `C-b C-b` reaches the inner
 session's prefix when you want its scrollback.
+
+## small screens
+
+below `HQ_NARROW` columns (default 100) hq shows one full-screen pane at
+a time instead of the split: the claude fills the screen, tab keys still
+switch, and `C-b o` flips to the full-screen board and back. attach from
+a phone and it just happens; back on a wide terminal it un-zooms itself.
+`HQ_NARROW=0` forces the split everywhere.
+
+## exit / restart
+
+everything is detach, nothing needs killing: `q` on the board or plain
+`C-b d` leaves all claudes and robots running — `hq` re-attaches. ctrl-c
+in the right pane goes to the claude you're looking at, not to hq.
+`hq restart` rebuilds the board + viewer (claudes untouched).
 
 claudes running in other tmux sessions show up as dim `ext` tabs — enter
 switches the client to them.
