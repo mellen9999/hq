@@ -21,7 +21,7 @@ CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
   "${HQ_BAR_TTL:=60}"
 S="${HQ_SESSION:-hq}"
 X="${S}x"                                   # robot container (never attached)
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hq"
+
 RUN="${XDG_RUNTIME_DIR:-/tmp}/hq"
 STATED="$RUN/state"
 SELF=$(realpath "$0")
@@ -41,13 +41,6 @@ age_fmt() {  # $1 seconds → g_af, ≤3 chars
   else                        g_af="$((s / 86400))d"; fi
 }
 
-dur_fmt() {  # $1 seconds → g_df, ≤5 chars
-  local s=$1; (( s < 0 )) && s=0
-  if   (( s < 60 ));   then g_df="${s}s"
-  elif (( s < 600 ));  then printf -v g_df '%dm%02ds' $((s / 60)) $((s % 60))
-  elif (( s < 3600 )); then g_df="$((s / 60))m"
-  else                      printf -v g_df '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60)); fi
-}
 
 short_model() {  # claude-opus-4-7 → opus47 (strip vendor, dates, dashes)
   local m=${1#claude-}
@@ -185,9 +178,7 @@ bar() {
 # your own tmux and closes. no separate session to live in.
 
 declare -a tid tsess tpane tname ttitle tmdl tctx tglyph tsym tage trobot
-declare -a runlogs=()
-declare -A R_META R_START
-sel=0 msg='' help=0 NOW=0 CW='' g_af='' g_df='' g_sm='' g_cm=0 g_tf=''
+sel=0 msg='' help=0 NOW=0 CW='' CH='' g_af='' g_sm='' g_cm=0 g_tf=''
 g_state='' g_since=0 m='' c=''
 
 scan() {
@@ -232,31 +223,25 @@ scan() {
   (( sel < 0 )) && sel=0
 }
 
-runs_scan() {  # robot run history: rc, duration, first line of the prompt
-  local f b rc ts sum l
-  # shellcheck disable=SC2012
-  mapfile -t runlogs < <(ls -t "$STATE"/*/runs/*.log 2>/dev/null | head -5)
-  for f in ${runlogs[@]+"${runlogs[@]}"}; do
-    [ -n "${R_START[$f]:-}" ] && [ -n "${R_META[$f]:-}" ] &&
-      case ${R_META[$f]} in live*) ;; *) continue ;; esac
-    b=${f##*/}
-    [ -n "${R_START[$f]:-}" ] || R_START[$f]=$(date -ud "${b:0:4}-${b:4:2}-${b:6:2} ${b:9:2}:${b:11:2}:${b:13:2}Z" +%s 2>/dev/null || echo 0)
-    rc='' sum=''
-    while IFS= read -r l; do case $l in '# exit '*) rc=$l ;; esac; done < <(tail -c 200 "$f" 2>/dev/null)
-    while IFS= read -r l; do case $l in '#'*|'') ;; *) sum=$l; break ;; esac; done < "$f"
-    if [ -n "$rc" ]; then
-      read -r _ _ rc ts _ <<<"$rc"
-      ts=$(date -ud "${ts:-}" +%s 2>/dev/null || echo "$NOW")
-      R_META[$f]="$rc|$ts|$sum"
-    else
-      R_META[$f]="live|0|$sum"
-    fi
+preview() {  # the last thing the selected claude actually said, live. this is
+  # the point of the board: j/k reads every session without entering any.
+  local -a raw
+  local i last=-1 n=$1
+  (( n > 0 )) || return 0
+  [ -n "${tpane[sel]:-}" ] || return 0
+  mapfile -t raw < <(tmux capture-pane -p -t "${tpane[sel]}" 2>/dev/null)
+  for i in "${!raw[@]}"; do [ -n "${raw[i]// /}" ] && last=$i; done
+  (( last < 0 )) && return 0
+  i=$(( last - n + 1 )); (( i < 0 )) && i=0
+  for (( ; i <= last; i++ )); do
+    printf '%s\n' "${raw[i]:0:CW}"
   done
 }
 
 render() {
   [ -n "$CW" ] || CW=$(tput cols 2>/dev/null || echo 60)
-  local cw=$CW tw=$((CW - 24)) buf plain i n=${#tid[@]} cc ps pct f meta rc rest end sum
+  [ -n "$CH" ] || CH=$(tput lines 2>/dev/null || echo 24)
+  local cw=$CW tw=$((CW - 24)) buf plain i n=${#tid[@]} cc ps pct
   TZ=UTC0 printf -v plain '%(%H:%M:%SZ)T' -1
   buf="${E}[38;5;208;1mhq${R} $plain   ${E}[38;5;244m$n claude$( ((n==1)) || echo s)${R}"$'\n\n'
   (( n == 0 )) && buf+='  no claude sessions running'$'\n'
@@ -283,30 +268,20 @@ render() {
     fi
     buf+=$plain$'\n'
   done
-  if (( ${#runlogs[@]} )); then
-    buf+=$'\n'"${E}[38;5;226mrobot runs${R}"$'\n'
-    for f in "${runlogs[@]}"; do
-      meta=${R_META[$f]:-}; [ -n "$meta" ] || continue
-      rc=${meta%%|*}; rest=${meta#*|}; end=${rest%%|*}; sum=${rest#*|}
-      if [ "$rc" = live ]; then cc=226; dur_fmt $(( NOW - ${R_START[$f]:-NOW} ))
-      else
-        if [ "$rc" = 0 ]; then cc=40; else cc=196; fi
-        dur_fmt $(( end - ${R_START[$f]:-end} ))
-      fi
-      printf -v plain '  %s%4s%s %5s %s' "${E}[38;5;${cc}m" "$rc" "$R" "$g_df" "${sum:0:$((cw - 16))}"
-      buf+=$plain$'\n'
-    done
-  fi
   [ -n "$msg" ] && buf+=$'\n'"  ${E}[38;5;196m$msg${R}"$'\n'
+  local foot avail
   if (( help )); then
-    buf+=$'\n'"${E}[38;5;244m j/k  move        enter  jump to it"$'\n'
-    buf+=' gg/G 1-9 top/bottom/jump'$'\n'
-    buf+=' n    new claude in this session'$'\n'
-    buf+=" x    kill a robot run     q  close${R}"$'\n'
+    foot="${E}[38;5;244m j/k move · enter jump in · n new · x kill robot · q close${R}"$'\n'
   else
-    buf+=$'\n'"${E}[38;5;244m j/k pick · enter jump · n new · q close · ? keys${R}"$'\n'
+    foot="${E}[38;5;244m j/k read · enter jump in · q close · ? keys${R}"$'\n'
   fi
-  printf '%s[H%s[2J%s' "$E" "$E" "$buf"
+  # everything left over after the list and footer is live output
+  avail=$(( CH - n - 5 ))
+  if (( avail > 1 )) && (( n )); then
+    buf+=$'\n'"${E}[38;5;244m── ${ttitle[sel]:0:$((cw - 6))} ${R}"$'\n'
+    buf+=$(preview "$avail")$'\n'
+  fi
+  printf '%s[H%s[2J%s%s' "$E" "$E" "$buf" "$foot"
 }
 
 jump() {  # go to the selected claude in the caller's own client, then close
@@ -334,12 +309,12 @@ killrun() {
 board() {
   [ -t 0 ] || { echo 'hq board: needs a tty (run "hq")' >&2; exit 1; }
   trap 'stty sane 2>/dev/null; printf "\e[?25h"' EXIT INT TERM
-  trap 'CW=' WINCH
+  trap 'CW="" CH=""' WINCH
   printf '\e[?25l'
   local key k2 rc last
-  scan; runs_scan; render; last=$SECONDS
+  scan; render; last=$SECONDS
   while :; do
-    if (( SECONDS - last >= HQ_TICK )); then scan; runs_scan; render; last=$SECONDS; fi
+    if (( SECONDS - last >= HQ_TICK )); then scan; render; last=$SECONDS; fi
     key=''
     IFS= read -rsn1 -t 1 key
     rc=$?
@@ -360,7 +335,7 @@ board() {
       ''|l) jump && exit 0; render ;;
       n) tmux new-window -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null; exit 0 ;;
       x) killrun ;;
-      r) scan; runs_scan; render ;;
+      r) scan; render ;;
       q) exit 0 ;;
       '?') help=$(( 1 - help )); render ;;
     esac

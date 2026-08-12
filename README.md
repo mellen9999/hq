@@ -26,16 +26,19 @@ hq 04:12:07Z   4 claudes
  1 ◐ 12m opus5     44% auth-token-fix
  2 ●  3s opus5     91% lossless-chat-archive
  3 ○  4h haiku45    8% waydroid setup
- 4 ●  44s opus5     23% fix-083808
+ 4 ● 44s opus5     23% fix-083808
 
-robot runs
-     0 3m12s prod alert: healthcheck 500s — fixed, verified
-  live 1m04s bug triage: image upload
+── auth-token-fix
+● Running 1 shell command · 6m 23s…
+  ⎿  $ adb devices -l 2>&1 | head -5
+     (ctrl+g to run in background)
 
- j/k pick · enter jump · n new · q close · ? keys
+ j/k read · enter jump in · q close · ? keys
 ```
 
-enter takes you to that claude in your own tmux and closes the popup.
+j/k walks the list and the bottom half is that session's **live output** —
+you read every claude without entering any of them. enter takes you to the
+selected one in your own tmux and closes the popup.
 
 ## install
 
