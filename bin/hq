@@ -75,17 +75,21 @@ view() {  # right pane: live window of hqx; self-heals if hqx dies
 }
 
 hooks() {
-  cat <<'EOF'
+  # absolute path: hook commands run with the spawning claude's PATH, which
+  # for robot panes is the tmux server's — ~/.local/bin may not be on it
+  local hs
+  hs="$(dirname "$SELF")/hq-status"
+  cat <<EOF
 merge into ~/.claude/settings.json for status glyphs on the board
 (working ● / waiting ◐ / done ○), optional:
 
 {
   "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "hq-status working" }] }],
-    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "hq-status working" }] }],
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "hq-status waiting" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "hq-status done" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "hq-status gone" }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "$hs working" }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "$hs working" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "$hs waiting" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "$hs done" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "$hs gone" }] }]
   }
 }
 EOF
