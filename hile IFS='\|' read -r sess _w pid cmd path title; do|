@@ -1,1 +1,0 @@
-. read -r sess win pid cmd path title; do$|' read -r sess win pid cmd path title; do
