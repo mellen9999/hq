@@ -87,8 +87,11 @@ everything is detach, nothing needs killing: `q` on the board or plain
 in the right pane goes to the claude you're looking at, not to hq.
 `hq restart` rebuilds the board + viewer (claudes untouched).
 
-claudes running in other tmux sessions show up as dim `ext` tabs — enter
-switches the client to them.
+claudes running in other tmux sessions are adopted as live tabs
+(tmux window links — same window, so you watch AND type, from any
+client). j/k walks every claude on the server. their home sessions
+keep them; when a claude exits, the tab is handed back. `HQ_LINK=0`
+in hqrc keeps hq to its own claudes only.
 
 ## robots
 

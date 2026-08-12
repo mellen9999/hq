@@ -193,13 +193,38 @@ sel=0 sel_id='' help=0 msg='' last_act='' nav=''
 
 scan() {
   tid=() tkind=() tname=() tpane=() tlabel=()
-  local wid name act pid cmd path title sess widx m i cur_act=''
-  while IFS='|' read -r wid name act pid cmd path title; do
-    tid+=("$wid") tkind+=(in) tname+=("$name") tpane+=("$pid")
+  local wid name act lnk pid cmd path title sess m i cur_act='' hqids
+  # adopt: link every claude window elsewhere on the server into hqx — a
+  # linked window IS the same window, so its tab is live and typeable, and
+  # j/k covers every claude with zero session-hopping. HQ_LINK=0 disables.
+  if [ "${HQ_LINK:-1}" = 1 ]; then
+    hqids=$(tmux list-windows -t "=$X" -F '#{window_id}' 2>/dev/null)
+    while IFS='|' read -r sess wid cmd title; do
+      case "$sess" in "$S"|"$X") continue ;; esac
+      # claude either owns the tty (cmd=claude) or sits behind a wrapper
+      # shell — then its title glyph (✳ / braille spinner) gives it away
+      case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *) continue ;; esac
+      printf '%s\n' "$hqids" | grep -qx "$wid" && continue
+      tmux link-window -d -s "$wid" -t "=$X:" 2>/dev/null || continue
+      tmux set -w -t "$wid" @hqlink 1 2>/dev/null
+      # without this a small hq client would clamp the window in its home
+      # session too; with it the window sizes to wherever it is active
+      tmux set -w -t "$wid" aggressive-resize on 2>/dev/null
+      hqids=$(printf '%s\n%s' "$hqids" "$wid")
+    done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_current_command}|#{pane_title}' 2>/dev/null)
+  fi
+  while IFS='|' read -r wid name act lnk pid cmd path title; do
+    if [ "$lnk" = 1 ]; then
+      # adopted claude that exited → hand the window back to its home session
+      case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *)
+        tmux unlink-window -t "=$X:$wid" 2>/dev/null && continue ;; esac
+    fi
+    tid+=("$wid") tname+=("$name") tpane+=("$pid")
+    [ "$lnk" = 1 ] && tkind+=(ln) || tkind+=(in)
     [ "$act" = 1 ] && cur_act=$wid
     m=$(model_for "$path" "$title" </dev/null)
     tlabel+=("$(printf '%-10.10s %-9.9s %s' "$name" "${m:--}" "$title")")
-  done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{window_active}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{window_active}|#{@hqlink}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
   # M-j/M-k switch hqx windows without touching the board — follow them
   if [ -n "$cur_act" ] && [ "$cur_act" != "$last_act" ]; then
     last_act=$cur_act
@@ -209,15 +234,6 @@ scan() {
   # select-window anywhere in hqx pokes us (C-l) for an instant bar update
   tmux set-hook -t "$X:" after-select-window \
     "run-shell \"tmux send-keys -t '$TMUX_PANE' C-l 2>/dev/null\"" 2>/dev/null
-  while IFS='|' read -r sess widx pid cmd path title; do
-    case "$sess" in "$S"|"$X") continue ;; esac
-    # claude either owns the tty (cmd=claude) or sits behind a wrapper
-    # shell — then its title glyph (✳ / braille spinner) gives it away
-    case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *) continue ;; esac
-    tid+=("$sess:$widx") tkind+=(ex) tname+=("$sess:$widx") tpane+=("$pid")
-    m=$(model_for "$path" "$title" </dev/null)
-    tlabel+=("$(printf '%-10.10s %-9.9s %s' "$sess:$widx" "${m:--}" "$title")")
-  done < <(tmux list-panes -a -F '#{session_name}|#{window_index}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
   local found=''
   if [ -n "$sel_id" ]; then
     for i in "${!tid[@]}"; do [ "${tid[i]}" = "$sel_id" ] && { sel=$i; found=1; break; }; done
@@ -239,13 +255,13 @@ render() {
     hdr tabs
     (( n == 0 )) && printf '  none\n'
     for i in "${!tid[@]}"; do
-      line=$(printf '%d %s%s' "$((i+1))" "${tlabel[i]}" "$([ "${tkind[i]}" = ex ] && printf ' ext')")
+      line=$(printf '%d %s' "$((i+1))" "${tlabel[i]}")
       line=$(printf '%s' "$line" | cut -c1-$((cw - 3)))
       if (( i == sel )); then
         printf ' %s[7m%-*s%s\n' "$E" "$((cw - 2))" "$line" "$R"
       elif is_robot "${tname[i]}"; then
         printf ' %s %s[38;5;208m%s%s\n' "$(glyph "${tpane[i]}")" "$E" "$line" "$R"
-      elif [ "${tkind[i]}" = ex ]; then
+      elif [ "${tkind[i]}" = ln ]; then
         printf ' %s %s[38;5;244m%s%s\n' "$(glyph "${tpane[i]}")" "$E" "$line" "$R"
       else
         printf ' %s %s\n' "$(glyph "${tpane[i]}")" "$line"
@@ -294,18 +310,13 @@ autozoom() {  # phone-sized clients get one full-screen pane at a time:
   return 0
 }
 
-preview() { [ "${tkind[sel]:-}" = in ] && tmux select-window -t "${tid[sel]}" 2>/dev/null; return 0; }
+preview() { [ -n "${tid[sel]:-}" ] && tmux select-window -t "${tid[sel]}" 2>/dev/null; return 0; }
 
 focus() {
-  local c
-  if [ "${tkind[sel]:-}" = in ]; then
-    tmux select-window -t "${tid[sel]}" 2>/dev/null
-    tmux select-pane -t "$(rpane)" 2>/dev/null
-    autozoom
-  elif [ "${tkind[sel]:-}" = ex ]; then
-    c=$(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null | head -1)
-    [ -n "$c" ] && tmux switch-client -c "$c" -t "${tid[sel]}" 2>/dev/null
-  fi
+  [ -n "${tid[sel]:-}" ] || return 0
+  tmux select-window -t "${tid[sel]}" 2>/dev/null
+  tmux select-pane -t "$(rpane)" 2>/dev/null
+  autozoom
   return 0
 }
 
