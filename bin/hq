@@ -515,6 +515,7 @@ render() {
     buf+=$plain$'\n'
   done
   [ -n "$msg" ] && buf+=$'\n'"  ${E}[38;5;196m$msg${R}"$'\n'
+  (( help )) || buf+=$'\n'"${E}[38;5;244m j/k pick · enter open · q leave · ? keys${R}"$'\n'
   if (( help )); then
     buf+=$'\n'"${E}[38;5;244m j/k gg G 1-9 move · enter/i type · n new"$'\n'
     buf+=' x kill robot · r refresh · q leave'$'\n'
@@ -665,8 +666,11 @@ case "${1:-}" in
     tmux set -t "$S:" status-right '' 2>/dev/null
     tmux set -w -t "$S:hq" window-status-format '' 2>/dev/null
     tmux set -w -t "$S:hq" window-status-current-format '' 2>/dev/null
-    # typing-first: cursor lives in the claude input; M-h hops to the board
-    tmux select-pane -t "$(rpane)" 2>/dev/null
+    # entering hq lands on the BOARD — it is the home screen. on narrow
+    # clients that means a fullscreen board; enter dives into the selected
+    # claude fullscreen, C-b o flips back. M-l / enter reach the input on
+    # wide screens too.
+    tmux select-pane -t "$(lpane)" 2>/dev/null
     if [ -t 0 ]; then
       if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$S"
       else exec tmux attach -t "=$S"; fi
