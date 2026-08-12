@@ -38,15 +38,42 @@ ensure() {  # inner session up; race-safe against hq-poll doing the same
 lpane() { tmux list-panes -t "=$S:hq" -F '#{pane_left} #{pane_id}' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2; }
 rpane() { tmux list-panes -t "=$S:hq" -F '#{pane_left} #{pane_id}' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2; }
 
+newtab() { tmux new-window -t "=$X:" -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null; }
+
+nth() {  # select the Nth hqx window (board tab order)
+  local w
+  w=$(tmux list-windows -t "=$X" -F '#{window_id}' 2>/dev/null | sed -n "${1}p")
+  [ -n "$w" ] && tmux select-window -t "$w"
+}
+
+binds() {  # root-table keys, live even while typing in a claude. if-shell
+  # scoped: they act only when the client is on session $S, pass through
+  # everywhere else. HQ_BINDS=0 in hqrc removes them.
+  local g="#{==:#{session_name},$S}" i
+  if [ "${HQ_BINDS:-1}" != 1 ]; then
+    for i in j k h l n 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
+    return 0
+  fi
+  tmux bind -n M-j if -F "$g" "next-window -t '$X:'"     "send-keys M-j"
+  tmux bind -n M-k if -F "$g" "previous-window -t '$X:'" "send-keys M-k"
+  tmux bind -n M-h if -F "$g" 'select-pane -L'           "send-keys M-h"
+  tmux bind -n M-l if -F "$g" 'select-pane -R'           "send-keys M-l"
+  tmux bind -n M-n if -F "$g" "run-shell '$SELF newtab'" "send-keys M-n"
+  for i in 1 2 3 4 5 6 7 8 9; do
+    tmux bind -n "M-$i" if -F "$g" "run-shell '$SELF nth $i'" "send-keys M-$i"
+  done
+}
+
 migrate() {  # one-time: pre-tab shape had claude running directly in pane 2
   tmux has-session -t "=$S" 2>/dev/null || return 0
   [ "$(tmux list-panes -t "=$S:hq" 2>/dev/null | wc -l)" -ge 2 ] || return 0
   local rp wid name
   rp=$(rpane)
   # new shape iff the right pane was started as our viewer (current_command is
-  # useless here — it reports the wrapper shell, not the attached tmux client)
+  # useless here — it reports the wrapper shell, not the attached tmux client;
+  # NOT a suffix match — tmux stores the start command wrapped in quotes)
   case "$(tmux display -p -t "$rp" '#{pane_start_command}' 2>/dev/null)" in
-    *' view') return 0 ;;
+    *' view'*) return 0 ;;
   esac
   # move the live claude pane into hqx unharmed; create hqx around it if needed
   if tmux has-session -t "=$X" 2>/dev/null; then
@@ -141,16 +168,25 @@ glyph() {  # $1 = pane id → hook-reported state, empty if hooks not wired
 is_robot() { [[ "$1" =~ ^[a-z]+-[0-9]{6}$ ]]; }
 
 declare -a tid tkind tname tpane tlabel
-sel=0 sel_id='' help=0 msg=''
+sel=0 sel_id='' help=0 msg='' last_act=''
 
 scan() {
   tid=() tkind=() tname=() tpane=() tlabel=()
-  local wid name pid cmd path title sess widx m i
-  while IFS='|' read -r wid name pid cmd path title; do
+  local wid name act pid cmd path title sess widx m i cur_act=''
+  while IFS='|' read -r wid name act pid cmd path title; do
     tid+=("$wid") tkind+=(in) tname+=("$name") tpane+=("$pid")
+    [ "$act" = 1 ] && cur_act=$wid
     m=$(model_for "$path" "$title" </dev/null)
     tlabel+=("$(printf '%-10.10s %-9.9s %s' "$name" "${m:--}" "$title")")
-  done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{window_active}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  # M-j/M-k switch hqx windows without touching the board — follow them
+  if [ -n "$cur_act" ] && [ "$cur_act" != "$last_act" ]; then
+    last_act=$cur_act
+    sel_id=$cur_act
+  fi
+  # select-window anywhere in hqx pokes us (C-l) for an instant bar update
+  tmux set-hook -t "$X:" after-select-window \
+    "run-shell \"tmux send-keys -t '$TMUX_PANE' C-l 2>/dev/null\"" 2>/dev/null
   while IFS='|' read -r sess widx pid cmd path title; do
     case "$sess" in "$S"|"$X") continue ;; esac
     # claude either owns the tty (cmd=claude) or sits behind a wrapper
@@ -212,7 +248,7 @@ render() {
     done
 
     [ -n "$msg" ] && printf '\n  %s[38;5;196m%s%s\n' "$E" "$msg" "$R"
-    (( help )) && printf '\n%s[38;5;244m j/k gg G 1-9 move · enter type · n new\n x kill robot · r refresh · q detach%s\n' "$E" "$R"
+    (( help )) && printf '\n%s[38;5;244m j/k gg G 1-9 move · enter/i type · n new\n x kill robot · r refresh · q detach\n M-j/k tabs · M-h/l panes · M-n new\n (M- keys work while typing)%s\n' "$E" "$R"
   )
   printf '%s[H%s[2J%s\n' "$E" "$E" "$buf"
 }
@@ -261,8 +297,9 @@ handle() {
        [ "$k2" = g ] && { sel=0; sel_id=${tid[0]:-}; preview; render; } ;;
     G) (( ${#tid[@]} )) && { sel=$(( ${#tid[@]} - 1 )); sel_id=${tid[sel]}; preview; }; render ;;
     [1-9]) (( key <= ${#tid[@]} )) && { sel=$((key - 1)); sel_id=${tid[sel]}; preview; focus; }; render ;;
-    ''|l) focus ;;
-    n) tmux new-window -d -t "=$X:" -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null || ensure
+    ''|l|i) focus ;;
+    $'\f') scan; render ;;   # C-l poke from the after-select-window hook
+    n) newtab || ensure
        scan; render ;;
     x) killtab ;;
     r) : > "$CACHE"; scan; render ;;
@@ -300,21 +337,25 @@ case "${1:-}" in
   board) board ;;
   view)  view ;;
   hooks) hooks ;;
+  newtab) newtab ;;
+  nth) nth "${2:-1}" ;;
   '')
     migrate
     ensure
+    binds
     tmux has-session -t "=$S" 2>/dev/null ||
       tmux new-session -d -s "$S" -n hq "$RUN board"
     if [ "$(tmux list-panes -t "=$S:hq" 2>/dev/null | wc -l)" -lt 2 ]; then
       tmux split-window -h -t "=$S:hq" "$RUN view"
       tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
     fi
-    tmux select-pane -t "$(lpane)" 2>/dev/null
+    # typing-first: cursor lives in the claude input; M-h hops to the board
+    tmux select-pane -t "$(rpane)" 2>/dev/null
     if [ -t 0 ]; then
       if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$S"
       else exec tmux attach -t "=$S"; fi
     fi
     echo "hq: sessions ready (no tty — attach with: tmux attach -t $S)"
     ;;
-  *) echo 'usage: hq [board|view|hooks]' >&2; exit 2 ;;
+  *) echo 'usage: hq [board|view|hooks|newtab|nth N]' >&2; exit 2 ;;
 esac

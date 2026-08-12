@@ -36,12 +36,22 @@ hq
 builds two tmux sessions — `hq` (board + viewer) and `hqx` (one window per
 claude) — and attaches. safe to re-run; re-attaches and heals missing panes.
 
-keys (board pane):
+the cursor lives in the claude input — just type. these work from anywhere
+in the hq session, typing included (alt keys, scoped to hq only):
+
+```
+M-j M-k   next / previous tab
+M-1..9    jump to tab
+M-n       new claude tab
+M-h M-l   hop board <-> input
+```
+
+board keys (after M-h):
 
 ```
 j/k       move (selection previews live on the right)
 gg G 1-9  top / bottom / jump
-enter, l  put the cursor in the selected claude
+enter l i back to the input, cursor in the selected claude
 n         new claude tab
 x         kill selected robot (asks y/N; robots only)
 r         refresh
@@ -49,7 +59,7 @@ q         detach
 ?         help
 ```
 
-`C-b o` hops back from the claude to the board. `C-b C-b` reaches the inner
+`HQ_BINDS=0` in hqrc removes the alt keys. `C-b C-b` reaches the inner
 session's prefix when you want its scrollback.
 
 claudes running in other tmux sessions show up as dim `ext` tabs — enter
@@ -89,4 +99,5 @@ HQ_WIDTH    board pane width               (default 46)
 HQ_TICK     board refresh seconds          (default 2)
 HQ_SESSION  outer session name             (default hq; inner = <name>x)
 HQ_REAP_S   robot reap age seconds         (default 2700)
+HQ_BINDS    0 = no alt keys                (default 1)
 ```
