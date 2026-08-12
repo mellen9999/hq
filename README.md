@@ -66,8 +66,9 @@ batched stat per tick — no grep, no awk, no tail.
 
 ## keys
 
-the cursor lives in the claude input — just type. these work from anywhere
-in the hq session, typing included (alt keys, scoped to hq only):
+entering hq lands on the board: pick with j/k, dive in with enter, and
+once you're in a claude just type. these work from anywhere in the hq
+session, typing included (alt keys, scoped to hq only):
 
 ```
 M-j M-k   next / previous tab — and arm nav mode
@@ -91,7 +92,8 @@ enter l i back to the input, cursor in the selected claude
 n         new claude tab
 x         kill selected robot (asks y/N; robots only)
 r         flush caches and rescan
-q         detach
+R         restart hq (claudes untouched)
+q         leave, back to your previous session
 ?         help
 ```
 
@@ -118,7 +120,7 @@ all of them.
 
 ```
 M-q          toggle: hq from anywhere <-> back where you were
-             (no alt? C-b Tab does the same)
+             (no alt? C-b Tab or C-b h do the same)
 q  (board)   leave hq, back to your previous session
 C-b d        detach from tmux entirely — everything keeps running
 hq           from any shell: build if needed + enter

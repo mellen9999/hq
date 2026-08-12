@@ -50,6 +50,21 @@ nth() {  # select the Nth hqx window (board tab order)
   [ -n "$w" ] && tmux select-window -t "$w"
 }
 
+back() {  # leave hq: previous session, else any other session, else detach.
+  # a client that attached straight to hq has no "last" — the fallbacks keep
+  # the toggle from going dead.
+  local c o ok=''
+  for c in $(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null); do
+    if tmux switch-client -c "$c" -l 2>/dev/null; then ok=1
+    else
+      o=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -vx -e "$S" -e "$X" | head -1)
+      [ -n "$o" ] && tmux switch-client -c "$c" -t "$o" 2>/dev/null && ok=1
+    fi
+  done
+  [ -n "$ok" ] || tmux detach-client -s "=$S" 2>/dev/null
+  return 0
+}
+
 binds() {  # root-table keys, live even while typing in a claude. if-shell
   # scoped: they act only when the client is on session $S, pass through
   # everywhere else. HQ_BINDS=0 in hqrc removes them.
@@ -57,13 +72,15 @@ binds() {  # root-table keys, live even while typing in a claude. if-shell
   if [ "${HQ_BINDS:-1}" != 1 ]; then
     for i in j k h l n q Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
     tmux unbind -a -T hqnav 2>/dev/null
-    tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null; tmux unbind Tab 2>/dev/null
+    tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null
+    tmux unbind Tab 2>/dev/null; tmux unbind h 2>/dev/null
     tmux bind Space next-layout   # restore stock prefix-Space
     return 0
   fi
-  # the front door: M-q (phone: C-b Tab) toggles hq <-> wherever you were
-  tmux bind -n M-q if -F "$g" 'switch-client -l' "switch-client -t '=$S'"
-  tmux bind Tab if -F "$g" 'switch-client -l' "switch-client -t '=$S'"
+  # the front door: M-q (phone: C-b Tab or C-b h) toggles hq <-> where you were
+  tmux bind -n M-q if -F "$g" "run-shell '$SELF back'" "switch-client -t '=$S'"
+  tmux bind Tab if -F "$g" "run-shell '$SELF back'" "switch-client -t '=$S'"
+  tmux bind h if -F "$g" "run-shell '$SELF back'" "switch-client -t '=$S'"
   # M-j/M-k switch AND arm nav mode: follow-up bare j/k keep navigating,
   # the next typing key falls back to the claude (vim: i to be explicit)
   tmux bind -n M-j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav"     "send-keys M-j"
@@ -518,7 +535,7 @@ render() {
   (( help )) || buf+=$'\n'"${E}[38;5;244m j/k pick · enter open · q leave · ? keys${R}"$'\n'
   if (( help )); then
     buf+=$'\n'"${E}[38;5;244m j/k gg G 1-9 move · enter/i type · n new"$'\n'
-    buf+=' x kill robot · r refresh · q leave'$'\n'
+    buf+=' x kill robot · r refresh · R restart · q leave'$'\n'
     buf+=' M-q (C-b Tab) toggles hq in/out'$'\n'
     buf+=' M-j/k or M-Space arm nav mode: bare'$'\n'
     buf+=" j/k g G 1-9 switch tabs, i to type${R}"$'\n'
@@ -596,11 +613,8 @@ handle() {
        scan; render ;;
     x) killtab ;;
     r) flush; scan; runs_scan; poll_scan; render ;;
-    q) local c ok=''   # back to the session you came from; detach if none
-       for c in $(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null); do
-         tmux switch-client -c "$c" -l 2>/dev/null && ok=1
-       done
-       [ -n "$ok" ] || tmux detach-client -s "=$S" 2>/dev/null ;;
+    q) back ;;
+    R) tmux run-shell -b "$SELF restart" 2>/dev/null ;;
     '?') help=$(( 1 - help )); render ;;
   esac
   return 0
@@ -637,9 +651,14 @@ case "${1:-}" in
   hooks) hooks ;;
   newtab) newtab ;;
   nth) nth "${2:-1}" ;;
-  restart)  # rebuild board + viewer; claudes (hqx) untouched
+  restart)  # rebuild board + viewer; claudes (hqx) untouched. clients that
+    # were on hq get kicked by the kill — bring them back afterwards.
+    mapfile -t RCL < <(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null)
     tmux kill-session -t "=$S" 2>/dev/null
-    exec "$SELF" ;;
+    "$SELF" </dev/null >/dev/null 2>&1 || true
+    for c in ${RCL[@]+"${RCL[@]}"}; do tmux switch-client -c "$c" -t "=$S" 2>/dev/null; done
+    if [ -t 0 ] && [ -z "${TMUX:-}" ]; then exec tmux attach -t "=$S"; fi
+    echo 'hq: restarted' ;;
   kill)  # full teardown: ui first (else the viewer loop resurrects hqx),
     # then hqx. adopted claudes survive in their home sessions; hq-native
     # tabs and live robot runs die with hqx. timers keep polling headless.
@@ -652,10 +671,24 @@ case "${1:-}" in
     binds
     tmux has-session -t "=$S" 2>/dev/null ||
       tmux new-session -d -s "$S" -n hq "$RUN board"
-    if [ "$(tmux list-panes -t "=$S:hq" 2>/dev/null | wc -l)" -lt 2 ]; then
+    # heal by IDENTITY, not pane count: if the board pane died, blindly
+    # splitting a viewer would leave two viewers and no board
+    has_board='' has_view=''
+    while IFS= read -r pcmd; do
+      case $pcmd in *' board'*) has_board=1 ;; *' view'*) has_view=1 ;; esac
+    done < <(tmux list-panes -t "=$S:hq" -F '#{pane_start_command}' 2>/dev/null)
+    if [ -z "$has_view" ]; then
       tmux split-window -h -t "=$S:hq" "$RUN view"
       tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
     fi
+    if [ -z "$has_board" ]; then
+      tmux split-window -hb -t "=$S:hq" "$RUN board"
+      tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
+    fi
+    # same smallest-active-viewer rule as adopted windows — a phone and a
+    # desktop can both be on hq
+    tmux set -w -t "$S:hq" window-size smallest 2>/dev/null
+    tmux set -w -t "$S:hq" aggressive-resize on 2>/dev/null
     # the outer status line IS the tab strip (fed by the board via @hqtabs) —
     # tab feedback that survives the zoomed single-pane phone layout
     tmux set -t "$S:" status on 2>/dev/null
