@@ -141,9 +141,9 @@ bar() {
     mkdir -p "$RUN" 2>/dev/null
     { echo "$now"; for pane in "${!CPCT[@]}"; do echo "$pane ${CPCT[$pane]}"; done; } > "$cache" 2>/dev/null
   fi
-  (( wait_n )) && out+="#[fg=colour226,bold]◐ ${waitname:0:14}#[default] "
-  (( work_n )) && out+="#[fg=colour40]●$work_n#[default] "
-  (( maxpct >= 80 )) && out+="#[fg=colour196]${maxpct}%#[default] "
+  (( wait_n )) && out+="#[fg=yellow,bold]◐ ${waitname:0:14}#[default] "
+  (( work_n )) && out+="#[fg=green]●$work_n#[default] "
+  (( maxpct >= 80 )) && out+="#[fg=red]${maxpct}%#[default] "
   # tmux reads job output line-wise — a missing newline means it never appears
   [ -n "$out" ] && printf '%s  \n' "$out"
   return 0
