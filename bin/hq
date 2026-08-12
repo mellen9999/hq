@@ -1,207 +1,37 @@
 #!/bin/bash
-# hq — mission control for claude code in tmux. every running claude — yours
-# and robot ones — is a tab in a left column. j/k to move, enter to type.
+# hq — see every claude code session you're running, from the tmux you're
+# already in. no extra session, no attach/detach: a status-line signal for
+# the thing you can't otherwise know (which claude is blocked waiting for
+# you), and a popup board for the detail.
 #
-#   hq          build sessions if needed and attach
-#   hq restart  rebuild board + viewer; claudes untouched
-#   hq board    (internal) the left-pane tab board
-#   hq view     (internal) the right-pane viewer loop
-#   hq hooks    print the claude code hooks snippet for status glyphs
+#   hq          open the board over the current session (C-b h)
+#   hq bar      one status-line segment: waiting/working counts + ctx warning
+#   hq hooks    print the claude code hooks snippet that powers the states
+#   hq board    (internal) the popup body
 #
-# layout: outer session "hq" holds the board (left) and a viewer pane (right)
-# attached to inner session "hqx", where every window is one claude. selecting
-# a tab is just select-window on hqx — the viewer follows instantly.
+# robots (headless claude workers, see hq-poll) live in their own detached
+# session so they never clutter your window list; the board lists them and
+# jumps you there when you want them.
 set -u
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
 # shellcheck source=/dev/null
 [ -f "$CONF/hqrc" ] && . "$CONF/hqrc"
-: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_WIDTH:=46}" "${HQ_TICK:=2}" \
-  "${HQ_NARROW:=100}" "${HQ_CTX:=200000}"
+: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_TICK:=2}" "${HQ_CTX:=200000}" \
+  "${HQ_BAR_TTL:=60}"
 S="${HQ_SESSION:-hq}"
-X="${S}x"
+X="${S}x"                                   # robot container (never attached)
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hq"
-STATED="${XDG_RUNTIME_DIR:-/tmp}/hq/state"
+RUN="${XDG_RUNTIME_DIR:-/tmp}/hq"
+STATED="$RUN/state"
 SELF=$(realpath "$0")
-# pane commands run with the server's env, not ours — bake the session name in
-RUN="HQ_SESSION=$(printf '%q' "$S") exec $(printf '%q' "$SELF")"
 E=$'\e'
 R="${E}[0m"
 
-ensure() {  # inner session up; race-safe against hq-poll doing the same
-  tmux has-session -t "=$X" 2>/dev/null ||
-    tmux new-session -d -s "$X" -n main -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null
-  # detach-on-destroy: if hqx dies the viewer client must detach, never fall
-  # into another session (it would nest hq inside hq); the view loop respawns.
-  # "$X:" not "=$X" — set-option rejects the exact-match prefix
-  tmux set -t "$X:" status off 2>/dev/null
-  tmux set -t "$X:" detach-on-destroy on 2>/dev/null
-  return 0
-}
-
-lpane() { tmux list-panes -t "=$S:hq" -F '#{pane_left} #{pane_id}' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2; }
-rpane() { tmux list-panes -t "=$S:hq" -F '#{pane_left} #{pane_id}' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2; }
-
-newtab() { tmux new-window -t "=$X:" -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null; }
-
-nth() {  # select the Nth hqx window (board tab order)
-  local w
-  w=$(tmux list-windows -t "=$X" -F '#{window_id}' 2>/dev/null | sed -n "${1}p")
-  [ -n "$w" ] && tmux select-window -t "$w"
-}
-
-back() {  # leave hq: previous session, else any other session, else detach.
-  # a client that attached straight to hq has no "last" — the fallbacks keep
-  # the toggle from going dead.
-  local c o ok=''
-  for c in $(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null); do
-    if tmux switch-client -c "$c" -l 2>/dev/null; then ok=1
-    else
-      o=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -vx -e "$S" -e "$X" | head -1)
-      [ -n "$o" ] && tmux switch-client -c "$c" -t "$o" 2>/dev/null && ok=1
-    fi
-  done
-  [ -n "$ok" ] || tmux detach-client -s "=$S" 2>/dev/null
-  return 0
-}
-
-binds() {  # root-table keys, live even while typing in a claude. if-shell
-  # scoped: they act only when the client is on session $S, pass through
-  # everywhere else. HQ_BINDS=0 in hqrc removes them.
-  local g="#{==:#{session_name},$S}" i
-  if [ "${HQ_BINDS:-1}" != 1 ]; then
-    for i in j k h l n q Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
-    tmux unbind -a -T hqnav 2>/dev/null
-    tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null
-    tmux unbind Tab 2>/dev/null; tmux unbind h 2>/dev/null
-    tmux bind Space next-layout   # restore stock prefix-Space
-    return 0
-  fi
-  # the front door: M-q (phone: C-b Tab or C-b h) toggles hq <-> where you were
-  tmux bind -n M-q if -F "$g" "run-shell '$SELF back'" "switch-client -t '=$S'"
-  tmux bind Tab if -F "$g" "run-shell '$SELF back'" "switch-client -t '=$S'"
-  tmux bind h if -F "$g" "run-shell '$SELF back'" "switch-client -t '=$S'"
-  # M-j/M-k switch AND arm nav mode: follow-up bare j/k keep navigating,
-  # the next typing key falls back to the claude (vim: i to be explicit)
-  tmux bind -n M-j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav"     "send-keys M-j"
-  tmux bind -n M-k if -F "$g" "previous-window -t '$X:' ; switch-client -T hqnav" "send-keys M-k"
-  tmux bind -n M-Space if -F "$g" 'switch-client -T hqnav' 'send-keys M-Space'
-  # prefix fallbacks for keyboards without alt (phones): C-b j/k/Space
-  tmux bind j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav" ''
-  tmux bind k if -F "$g" "previous-window -t '$X:' ; switch-client -T hqnav" ''
-  tmux bind Space if -F "$g" 'switch-client -T hqnav' 'next-layout'
-  tmux bind -n M-h if -F "$g" 'select-pane -L'           "send-keys M-h"
-  tmux bind -n M-l if -F "$g" 'select-pane -R'           "send-keys M-l"
-  tmux bind -n M-n if -F "$g" "run-shell '$SELF newtab'" "send-keys M-n"
-  for i in 1 2 3 4 5 6 7 8 9; do
-    tmux bind -n "M-$i" if -F "$g" "run-shell '$SELF nth $i'" "send-keys M-$i"
-  done
-  # nav mode (sticky key table): bare vi keys, each one re-arms the table;
-  # any unbound key drops the client back to the root table = back to typing
-  tmux bind -T hqnav j "next-window -t '$X:' ; switch-client -T hqnav"
-  tmux bind -T hqnav k "previous-window -t '$X:' ; switch-client -T hqnav"
-  tmux bind -T hqnav g "select-window -t '$X:^' ; switch-client -T hqnav"
-  tmux bind -T hqnav G "select-window -t '$X:$' ; switch-client -T hqnav"
-  tmux bind -T hqnav n "run-shell '$SELF newtab'"
-  tmux bind -T hqnav h 'select-pane -L'
-  for i in 1 2 3 4 5 6 7 8 9; do
-    tmux bind -T hqnav "$i" "run-shell '$SELF nth $i' ; switch-client -T hqnav"
-  done
-}
-
-migrate() {  # one-time: pre-tab shape had claude running directly in pane 2
-  tmux has-session -t "=$S" 2>/dev/null || return 0
-  [ "$(tmux list-panes -t "=$S:hq" 2>/dev/null | wc -l)" -ge 2 ] || return 0
-  local rp wid name
-  rp=$(rpane)
-  # new shape iff the right pane was started as our viewer (current_command is
-  # useless here — it reports the wrapper shell, not the attached tmux client;
-  # NOT a suffix match — tmux stores the start command wrapped in quotes)
-  case "$(tmux display -p -t "$rp" '#{pane_start_command}' 2>/dev/null)" in
-    *' view'*) return 0 ;;
-  esac
-  # move the live claude pane into hqx unharmed; create hqx around it if needed
-  if tmux has-session -t "=$X" 2>/dev/null; then
-    tmux break-pane -d -s "$rp" -t "=$X:" -n main
-  else
-    local tmp
-    tmp=$(tmux new-session -dP -F '#{window_id}' -s "$X" -n hqtmp 'sleep 30')
-    tmux break-pane -d -s "$rp" -t "=$X:" -n main
-    [ -n "$tmp" ] && tmux kill-window -t "$tmp" 2>/dev/null
-  fi
-  # stray robot windows ride along
-  tmux list-windows -t "=$S" -F '#{window_id} #{window_name}' | while read -r wid name; do
-    [ "$name" = hq ] && continue
-    tmux move-window -d -s "$wid" -t "=$X:" 2>/dev/null
-  done
-  # old board loop → this board
-  tmux respawn-pane -k -t "$(lpane)" "$RUN board" 2>/dev/null
-}
-
-view() {  # right pane: live window of hqx; self-heals if hqx dies
-  while :; do
-    ensure
-    env -u TMUX tmux attach -t "=$X"
-    sleep 1
-  done
-}
-
-hooks() {
-  # absolute path: hook commands run with the spawning claude's PATH, which
-  # for robot panes is the tmux server's — ~/.local/bin may not be on it
-  local hs
-  hs="$(dirname "$SELF")/hq-status"
-  cat <<EOF
-merge into ~/.claude/settings.json for status glyphs on the board
-(working ● / waiting ◐ / done ○), optional:
-
-{
-  "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "$hs working" }] }],
-    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "$hs working" }] }],
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "$hs waiting" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "$hs done" }] }],
-    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "$hs gone" }] }]
-  }
-}
-EOF
-}
-
-# ---------------------------------------------------------------- board ----
-# perf model: the board is one long-lived process, so all caches are assoc
-# arrays in memory. per tick: a few tmux calls + ONE batched stat; transcripts
-# and logs are re-read only when their mtime moved. steady-state idle tick
-# runs zero grep/awk/tail.
-
-is_robot() { [[ "$1" =~ ^[a-z]+-[0-9]{6}$ ]]; }
-
-declare -A T_FILE T_SLUG T_MTIME T_MODEL T_CTX   # per pane: transcript probe
-declare -A MT                                     # path → mtime (batched stat)
-declare -A R_META R_MT R_START                    # run log → "rc|start|end", parse mtime, start epoch
-declare -A PL_ROW PL_TS PL_MT TN_NEXT             # robot → poll msg / its epoch / log mtime / next fire
-declare -a tid tkind tname tpane ttitle tmdl tctx tglyph tage
-declare -a runlogs=()
-sel=0 sel_id='' help=0 msg='' last_act='' nav='' NOW=0 CW='' HOST=''
-runs_sig='' hook_sig='' timers_at=0 g_glyph=' ' g_age='' g_af='' g_df='' laststrip=''
-
-# one awk pass per changed transcript gets model AND context tokens.
-# ctx = input + cache_creation + cache_read of the last main-chain usage
-# block — NOT every *_tokens field: output_tokens and the nested
-# cache_creation.ephemeral_* object would double-count. the [{,] boundary
-# stops input_tokens from matching inside cache_*_input_tokens. sidechain
-# (subagent) turns are skipped — their tiny ctx would lie about the session.
-# shellcheck disable=SC2016  # single quotes are the point: awk source, not shell
-AWK_PROBE='
-function tok(s, k) { return match(s, "[{,]\"" k "\":[0-9]+") ? substr(s, RSTART + length(k) + 4, RLENGTH - length(k) - 4) + 0 : 0 }
-{
-  if (match($0, /"model":"claude-[^"]*"/)) m = substr($0, RSTART + 9, RLENGTH - 10)
-  if ($0 !~ /"isSidechain":true/ && match($0, /"usage":\{[^}]*/)) {
-    u = substr($0, RSTART, RLENGTH)
-    c = tok(u, "input_tokens") + tok(u, "cache_creation_input_tokens") + tok(u, "cache_read_input_tokens")
-  }
-}
-END { print (m ? m : "-"), c + 0 }
-'
+# claude either owns the tty (cmd=claude) or sits behind a wrapper shell —
+# then its title glyph (✳ / braille spinner) gives it away
+is_claude() { case "$1:$2" in claude:*|*:✳*|*:[⠀-⣿]*) return 0 ;; esac; return 1; }
+is_robot()  { [[ "$1" =~ ^[a-z]+-[0-9]{6}$ ]]; }
 
 age_fmt() {  # $1 seconds → g_af, ≤3 chars
   local s=$1; (( s < 0 )) && s=0
@@ -227,220 +57,191 @@ short_model() {  # claude-opus-4-7 → opus47 (strip vendor, dates, dashes)
 
 ctx_max() {  # $1 model → g_cm context window; HQ_CTX covers unknown models
   case $1 in
-    *haiku*)                            g_cm=200000 ;;
-    *fable*|*mythos*|*opus*|*sonnet*)   g_cm=1000000 ;;
-    *)                                  g_cm=$HQ_CTX ;;
+    *haiku*)                          g_cm=200000 ;;
+    *fable*|*mythos*|*opus*|*sonnet*) g_cm=1000000 ;;
+    *)                                g_cm=$HQ_CTX ;;
   esac
 }
 
-hoststats() {  # /proc only, zero forks; empty off linux
-  local l _ k v mt=0 ma=0
-  [ -r /proc/loadavg ] || { HOST=''; return 0; }
-  read -r l _ < /proc/loadavg
-  while read -r k v _; do
-    case $k in MemTotal:) mt=$v ;; MemAvailable:) ma=$v; break ;; esac
-  done < /proc/meminfo
-  HOST="$l $(( (mt - ma) / 1048576 ))/$(( mt / 1048576 ))G"
+# one awk pass per changed transcript gets model AND context tokens.
+# ctx = input + cache_creation + cache_read of the last main-chain usage
+# block — NOT every *_tokens field: output_tokens and the nested
+# cache_creation.ephemeral_* object would double-count. the [{,] boundary
+# stops input_tokens from matching inside cache_*_input_tokens. sidechain
+# (subagent) turns are skipped — their tiny ctx would lie about the session.
+# shellcheck disable=SC2016  # single quotes are the point: awk source, not shell
+AWK_PROBE='
+function tok(s, k) { return match(s, "[{,]\"" k "\":[0-9]+") ? substr(s, RSTART + length(k) + 4, RLENGTH - length(k) - 4) + 0 : 0 }
+{
+  if (match($0, /"model":"claude-[^"]*"/)) m = substr($0, RSTART + 9, RLENGTH - 10)
+  if ($0 !~ /"isSidechain":true/ && match($0, /"usage":\{[^}]*/)) {
+    u = substr($0, RSTART, RLENGTH)
+    c = tok(u, "input_tokens") + tok(u, "cache_creation_input_tokens") + tok(u, "cache_read_input_tokens")
+  }
 }
+END { print (m ? m : "-"), c + 0 }
+'
 
-mstat() {  # ONE stat call for every watched file. safe unquoted expansion:
-  # transcript/state/log names are uuid/timestamp/pane-id — never whitespace
-  local -a fl=()
-  local p m
-  MT=()
-  for p in "${!T_FILE[@]}"; do [ -n "${T_FILE[$p]}" ] && fl+=("${T_FILE[$p]}"); done
-  for p in "${tpane[@]}"; do fl+=("$STATED/$p"); done
-  for p in "$STATE"/*/runs "$STATE"/*/poll.log "${runlogs[@]}"; do fl+=("$p"); done
-  (( ${#fl[@]} )) || return 0
-  while read -r m p; do MT[$p]=$m; done < <(stat -c '%Y %n' "${fl[@]}" 2>/dev/null)
-  return 0
-}
-
-resolve() {  # $1 pane, $2 project dir, $3 slug → T_FILE/T_SLUG. several
-  # sessions can share one project dir; the title slug appears in exactly
-  # one transcript, so this stays per-pane accurate. negative results cache
-  # too (T_SLUG set, T_FILE empty) — retried only when the slug changes.
+transcript() {  # $1 project cwd, $2 pane title → g_tf (newest matching jsonl).
+  # several sessions can share a project dir; the title slug appears in
+  # exactly one transcript, so this stays per-pane accurate.
+  local d slug f=''
   local -a t
-  local f=''
-  if [ -n "$3" ] && [ "$3" != "Claude Code" ]; then
+  d=${1//\//-}; d=${d//./-}
+  d="$HOME/.claude/projects/$d"
+  slug=${2#* }
+  if [ -n "$slug" ] && [ "$slug" != "Claude Code" ]; then
     # shellcheck disable=SC2012  # mtime order is the point; names are safe
-    mapfile -t t < <(ls -t "$2"/*.jsonl 2>/dev/null | head -12)
-    (( ${#t[@]} )) && f=$(grep -lF -- "$3" "${t[@]}" 2>/dev/null | head -1)
+    mapfile -t t < <(ls -t "$d"/*.jsonl 2>/dev/null | head -12)
+    (( ${#t[@]} )) && f=$(grep -lF -- "$slug" "${t[@]}" 2>/dev/null | head -1)
   fi
   # shellcheck disable=SC2012
-  [ -n "$f" ] || f=$(ls -t "$2"/*.jsonl 2>/dev/null | head -1)
-  T_SLUG[$1]=$3
-  T_FILE[$1]=$f
+  [ -n "$f" ] || f=$(ls -t "$d"/*.jsonl 2>/dev/null | head -1)
+  g_tf=$f
 }
 
-probe() {  # $1 pane, $2 pane cwd, $3 slug → T_MODEL/T_CTX, mtime-gated
-  local p=$1 q d f m c
-  f=${T_FILE[$p]:-}
-  if [ -z "${T_SLUG[$p]+x}" ] || [ "$3" != "${T_SLUG[$p]}" ] ||
-     { [ -n "$f" ] && [ -z "${MT[$f]:-}" ]; }; then
-    q=${2//\//-}; q=${q//./-}
-    d="$HOME/.claude/projects/$q"
-    resolve "$p" "$d" "$3"
-    f=${T_FILE[$p]:-}
-    [ -n "$f" ] && MT[$f]=$(stat -c %Y "$f" 2>/dev/null)
-  fi
-  [ -n "$f" ] || { T_MODEL[$p]='' T_CTX[$p]=0; return 0; }
-  if [ "${MT[$f]:-0}" != "${T_MTIME[$p]:-}" ]; then
-    read -r m c < <(tail -c 20000 "$f" | awk "$AWK_PROBE")
-    T_MODEL[$p]=${m:--} T_CTX[$p]=${c:-0} T_MTIME[$p]=${MT[$f]:-0}
-  fi
-  return 0
+pane_state() {  # $1 pane id → g_state (working|waiting|done|''), g_since epoch
+  local f="$STATED/$1" st _
+  g_state='' g_since=0
+  [ -r "$f" ] || return 0
+  read -r st _ < "$f" 2>/dev/null || return 0
+  case $st in working|waiting|done) g_state=$st ;; *) return 0 ;; esac
+  g_since=$(stat -c %Y "$f" 2>/dev/null || echo 0)
 }
 
-tabstate() {  # $1 pane, $2 transcript → g_glyph g_age, forkless. the state
-  # file mtime IS the state timestamp (hq-status rewrites it per event);
-  # hookless tabs fall back to transcript mtime = last-activity age.
-  local f="$STATED/$1" st _ ref=''
-  g_glyph=' ' g_age=''
-  if [ -n "${MT[$f]:-}" ]; then
-    read -r st _ < "$f" 2>/dev/null || st=''
-    case $st in
-      working) g_glyph="${E}[38;5;40m●${R}" ;;
-      waiting) g_glyph="${E}[1;38;5;226m◐${R}" ;;
-      done)    g_glyph="${E}[38;5;244m○${R}" ;;
+hooks() {
+  # absolute path: hook commands run with the spawning claude's PATH, which
+  # for robot panes is the tmux server's — ~/.local/bin may not be on it
+  local hs
+  hs="$(dirname "$SELF")/hq-status"
+  cat <<EOF
+merge into ~/.claude/settings.json — this is what powers the waiting/working
+signal in the status bar (without it hq still lists sessions, just no states):
+
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "$hs working" }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "$hs working" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "$hs waiting" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "$hs done" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "$hs gone" }] }]
+  }
+}
+EOF
+}
+
+# ------------------------------------------------------------------ bar ----
+# one segment for status-right, run every status-interval by every client:
+#   ◐ auth-fix   a claude is blocked on you (the whole point)
+#   ●2           two working
+#   91%          someone is near their context limit
+# cheap by construction: one tmux call + state-file reads. context needs a
+# transcript scan, so it is cached for HQ_BAR_TTL seconds.
+
+bar() {
+  local sess win pid cmd path title
+  local wait_n=0 work_n=0 waitname='' maxpct=0 out=''
+  local now=$EPOCHSECONDS cache="$RUN/bar" cts=0 pane pct
+  local -A CPCT=()
+  [ -r "$cache" ] && { read -r cts; while read -r pane pct; do CPCT[$pane]=$pct; done; } < "$cache"
+  local fresh=1
+  (( now - cts > HQ_BAR_TTL )) && fresh=''
+  while IFS='|' read -r sess win pid cmd path title; do
+    [ "$sess" = "$X" ] && continue          # robots: not a "waiting on you"
+    is_claude "$cmd" "$title" || continue
+    pane_state "$pid"
+    case $g_state in
+      waiting) (( wait_n++ )); [ -n "$waitname" ] || waitname=${title#* } ;;
+      working) (( work_n++ )) ;;
     esac
-    ref=${MT[$f]}
-  elif [ -n "${2:-}" ] && [ -n "${MT[$2]:-}" ]; then
-    ref=${MT[$2]}
+    if [ -n "$fresh" ]; then
+      pct=${CPCT[$pid]:-0}
+    else
+      pct=0
+      transcript "$path" "$title"
+      if [ -n "$g_tf" ]; then
+        read -r m c < <(tail -c 20000 "$g_tf" | awk "$AWK_PROBE")
+        short_model "$m"; ctx_max "$m"
+        pct=$(( ${c:-0} * 100 / g_cm )); (( pct > 99 )) && pct=99
+      fi
+      CPCT[$pid]=$pct
+    fi
+    (( pct > maxpct )) && maxpct=$pct
+  done < <(tmux list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  if [ -z "$fresh" ]; then
+    mkdir -p "$RUN" 2>/dev/null
+    { echo "$now"; for pane in "${!CPCT[@]}"; do echo "$pane ${CPCT[$pane]}"; done; } > "$cache" 2>/dev/null
   fi
-  if [ -n "$ref" ]; then age_fmt $(( NOW - ref )); g_age=$g_af; fi
+  (( wait_n )) && out+="#[fg=colour226,bold]◐ ${waitname:0:14}#[default] "
+  (( work_n )) && out+="#[fg=colour40]●$work_n#[default] "
+  (( maxpct >= 80 )) && out+="#[fg=colour196]${maxpct}%#[default] "
+  # tmux reads job output line-wise — a missing newline means it never appears
+  [ -n "$out" ] && printf '%s  \n' "$out"
   return 0
 }
+
+# ---------------------------------------------------------------- board ----
+# the popup: every claude on the machine, one row each. enter jumps to it in
+# your own tmux and closes. no separate session to live in.
+
+declare -a tid tsess tpane tname ttitle tmdl tctx tglyph tage trobot
+declare -a runlogs=()
+declare -A R_META R_START
+sel=0 msg='' help=0 NOW=0 CW='' g_af='' g_df='' g_sm='' g_cm=0 g_tf=''
+g_state='' g_since=0 m='' c=''
 
 scan() {
-  tid=() tkind=() tname=() tpane=() ttitle=() tmdl=() tctx=() tglyph=() tage=()
-  local wid name act lnk pid cmd path title sess i p cur_act='' hqids ids='' pct
-  local -a paths=() slugs=()
+  tid=() tsess=() tpane=() tname=() ttitle=() tmdl=() tctx=() tglyph=() tage=() trobot=()
+  local sess wid win pid cmd path title pct glyph seen=''
   NOW=$EPOCHSECONDS
-  # adopt: link every claude window elsewhere on the server into hqx — a
-  # linked window IS the same window, so its tab is live and typeable, and
-  # j/k covers every claude with zero session-hopping. HQ_LINK=0 disables.
-  if [ "${HQ_LINK:-1}" = 1 ]; then
-    hqids=$(tmux list-windows -t "=$X" -F '#{window_id}' 2>/dev/null)
-    while IFS='|' read -r sess wid cmd title; do
-      case "$sess" in "$S"|"$X") continue ;; esac
-      # claude either owns the tty (cmd=claude) or sits behind a wrapper
-      # shell — then its title glyph (✳ / braille spinner) gives it away
-      case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *) continue ;; esac
-      case $'\n'$hqids$'\n' in *$'\n'$wid$'\n'*) continue ;; esac
-      tmux link-window -d -s "$wid" -t "=$X:" 2>/dev/null || continue
-      tmux set -w -t "$wid" @hqlink 1 2>/dev/null
-      # a shared window must fit its smallest ACTIVE viewer or the bottom of
-      # the claude UI (input + status) falls off the small screen. NB: the
-      # default window-size "latest" silently IGNORES aggressive-resize —
-      # smallest + aggressive is the working combo (aggressive scopes
-      # "smallest" to sessions where the window is current, so an idle big
-      # client elsewhere doesn't clamp it)
-      tmux set -w -t "$wid" window-size smallest 2>/dev/null
-      tmux set -w -t "$wid" aggressive-resize on 2>/dev/null
-      hqids="$hqids"$'\n'"$wid"
-    done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_current_command}|#{pane_title}' 2>/dev/null)
-  fi
-  while IFS='|' read -r wid name act lnk pid cmd path title; do
-    if [ "$lnk" = 1 ]; then
-      # adopted claude that exited → hand the window back to its home session
-      case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *)
-        tmux unlink-window -t "=$X:$wid" 2>/dev/null && continue ;; esac
-    fi
-    tid+=("$wid") tname+=("$name") tpane+=("$pid") paths+=("$path")
-    slugs+=("${title#* }")
-    [ "$lnk" = 1 ] && tkind+=(ln) || tkind+=(in)
-    [ "$act" = 1 ] && cur_act=$wid
-    ids+=" $wid"
-  done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{window_active}|#{@hqlink}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
-  mstat
-  for i in "${!tid[@]}"; do
-    p=${tpane[i]}
-    probe "$p" "${paths[i]}" "${slugs[i]}"
-    if is_robot "${tname[i]}"; then ttitle[i]=${tname[i]}; else ttitle[i]=${slugs[i]}; fi
-    short_model "${T_MODEL[$p]:--}"; tmdl[i]=$g_sm
-    ctx_max "${T_MODEL[$p]:-}"
-    pct=$(( ${T_CTX[$p]:-0} * 100 / g_cm ))
-    (( pct > 99 )) && pct=99
-    (( ${T_CTX[$p]:-0} == 0 )) && pct=-1
-    tctx[i]=$pct
-    tabstate "$p" "${T_FILE[$p]:-}"
-    tglyph[i]=$g_glyph tage[i]=$g_age
-  done
-  for p in "${!T_FILE[@]}"; do   # sweep cache entries for panes that are gone
-    case " ${tpane[*]:-} " in *" $p "*) ;; *)
-      unset "T_FILE[$p]" "T_SLUG[$p]" "T_MTIME[$p]" "T_MODEL[$p]" "T_CTX[$p]" ;;
-    esac
-  done
-  # M-j/M-k switch hqx windows without touching the board — follow them
-  if [ -n "$cur_act" ] && [ "$cur_act" != "$last_act" ]; then
-    last_act=$cur_act
-    sel_id=$cur_act
-  fi
-  nav=$(tmux list-clients -t "=$S" -F '#{client_key_table}' 2>/dev/null | head -1)
-  # select-window anywhere in hqx pokes us (C-l) for an instant bar update;
-  # re-assert only when the window set changed (hqx may have been recreated)
-  if [ "$ids" != "$hook_sig" ]; then
-    hook_sig=$ids
-    tmux set-hook -t "$X:" after-select-window \
-      "run-shell \"tmux send-keys -t '$TMUX_PANE' C-l 2>/dev/null\"" 2>/dev/null
-  fi
-  local found=''
-  if [ -n "$sel_id" ]; then
-    for i in "${!tid[@]}"; do [ "${tid[i]}" = "$sel_id" ] && { sel=$i; found=1; break; }; done
-  fi
-  if [ -z "$found" ]; then
-    (( sel >= ${#tid[@]} )) && sel=$(( ${#tid[@]} - 1 ))
-    (( sel < 0 )) && sel=0
-    sel_id=${tid[sel]:-}
-  fi
-  strip_update
-}
-
-strip_update() {  # tab strip in the OUTER status line: always visible, even
-  # with the viewer zoomed full-screen (phones) — j/k feedback without the
-  # board. content rides a user option; status-left expands it with #{E:}.
-  local s='' i t c
-  for i in "${!tid[@]}"; do
-    t=${ttitle[i]//\#/}
-    t=${t:0:10}
-    if (( i == sel )); then
-      s+="#[fg=black,bg=white] $((i + 1)) $t #[default] "
+  while IFS='|' read -r sess wid win pid cmd path title; do
+    # a window linked into two sessions is listed once per session — same
+    # pane id both times, so dedupe on it
+    case $seen in *"|$pid|"*) continue ;; esac
+    seen+="|$pid|"
+    if [ "$sess" = "$X" ]; then
+      : # robot container: every window is ours, list it
     else
-      case ${tglyph[i]} in *◐*) s+='#[bold,fg=colour226]' ;; esac
-      s+="$((i + 1)) $t#[default]  "
+      is_claude "$cmd" "$title" || continue
+      [ "$sess" = "$S" ] && continue        # legacy hq session, if any lingers
     fi
-  done
-  [ "$nav" = hqnav ] && s+='#[bold,fg=colour226]nav#[default]'
-  [ "$s" = "$laststrip" ] && return 0
-  laststrip=$s
-  tmux set -t "$S:" @hqtabs "$s" 2>/dev/null
-  for c in $(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null); do
-    tmux refresh-client -S -t "$c" 2>/dev/null
-  done
-  return 0
+    tid+=("$wid") tsess+=("$sess") tpane+=("$pid") tname+=("$win")
+    if is_robot "$win"; then trobot+=(1); ttitle+=("$win")
+    else trobot+=(0); ttitle+=("${title#* }"); fi
+    pct=-1
+    transcript "$path" "$title"
+    if [ -n "$g_tf" ]; then
+      read -r m c < <(tail -c 20000 "$g_tf" | awk "$AWK_PROBE")
+      short_model "${m:--}"; ctx_max "${m:--}"
+      (( ${c:-0} )) && { pct=$(( c * 100 / g_cm )); (( pct > 99 )) && pct=99; }
+    else
+      g_sm='-'
+    fi
+    tmdl+=("$g_sm") tctx+=("$pct")
+    pane_state "$pid"
+    case $g_state in
+      working) glyph="${E}[38;5;40m●${R}" ;;
+      waiting) glyph="${E}[1;38;5;226m◐${R}" ;;
+      done)    glyph="${E}[38;5;244m○${R}" ;;
+      *)       glyph=' ' ;;
+    esac
+    tglyph+=("$glyph")
+    if (( g_since )); then age_fmt $(( NOW - g_since )); tage+=("$g_af"); else tage+=(''); fi
+  done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{window_name}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  (( sel >= ${#tid[@]} )) && sel=$(( ${#tid[@]} - 1 ))
+  (( sel < 0 )) && sel=0
 }
 
-runs_scan() {  # refresh run rows; forks only when something actually changed
-  local d f b rc ts sum l sig=''
-  for d in "$STATE"/*/runs; do sig+="${MT[$d]:-} "; done
-  if [ "$sig" != "$runs_sig" ]; then
-    runs_sig=$sig
-    # shellcheck disable=SC2012
-    mapfile -t runlogs < <(ls -t "$STATE"/*/runs/*.log 2>/dev/null | head -8)
-    for f in "${runlogs[@]}"; do
-      [ -n "${MT[$f]:-}" ] || MT[$f]=$(stat -c %Y "$f" 2>/dev/null)
-    done
-  fi
-  for f in "${runlogs[@]}"; do
-    if [ -z "${R_START[$f]:-}" ]; then
-      b=${f##*/}   # YYYYmmddTHHMMSSZ-name.log → epoch (date -d chokes on the
-      # compact form; reformat via substrings first)
-      R_START[$f]=$(date -ud "${b:0:4}-${b:4:2}-${b:6:2} ${b:9:2}:${b:11:2}:${b:13:2}Z" +%s 2>/dev/null || echo 0)
-    fi
-    [ "${MT[$f]:-0}" = "${R_MT[$f]:-}" ] && continue
-    R_MT[$f]=${MT[$f]:-0}
-    rc='' ts='' sum=''
+runs_scan() {  # robot run history: rc, duration, first line of the prompt
+  local f b rc ts sum l
+  # shellcheck disable=SC2012
+  mapfile -t runlogs < <(ls -t "$STATE"/*/runs/*.log 2>/dev/null | head -5)
+  for f in ${runlogs[@]+"${runlogs[@]}"}; do
+    [ -n "${R_START[$f]:-}" ] && [ -n "${R_META[$f]:-}" ] &&
+      case ${R_META[$f]} in live*) ;; *) continue ;; esac
+    b=${f##*/}
+    [ -n "${R_START[$f]:-}" ] || R_START[$f]=$(date -ud "${b:0:4}-${b:4:2}-${b:6:2} ${b:9:2}:${b:11:2}:${b:13:2}Z" +%s 2>/dev/null || echo 0)
+    rc='' sum=''
     while IFS= read -r l; do case $l in '# exit '*) rc=$l ;; esac; done < <(tail -c 200 "$f" 2>/dev/null)
     while IFS= read -r l; do case $l in '#'*|'') ;; *) sum=$l; break ;; esac; done < "$f"
     if [ -n "$rc" ]; then
@@ -451,131 +252,69 @@ runs_scan() {  # refresh run rows; forks only when something actually changed
       R_META[$f]="live|0|$sum"
     fi
   done
-  return 0
-}
-
-poll_scan() {  # poll tails + robot next-fire, mtime/interval gated
-  local d name p l ts
-  for d in "$STATE"/*/; do
-    d=${d%/}; name=${d##*/}
-    p="$d/poll.log"
-    [ -n "${MT[$p]:-}" ] || continue
-    if [ "${MT[$p]}" != "${PL_MT[$name]:-}" ]; then
-      PL_MT[$name]=${MT[$p]}
-      l=$(tail -n1 "$p" 2>/dev/null)
-      ts=${l%% *}
-      PL_TS[$name]=$(date -ud "$ts" +%s 2>/dev/null || echo "$NOW")
-      PL_ROW[$name]=${l#* }
-    fi
-    if (( NOW - timers_at >= 30 )) && [ -d /run/systemd/system ]; then
-      l=$(systemctl --user show "hq-$name.timer" -p NextElapseUSecRealtime --value 2>/dev/null)
-      # transiently empty/'-' while the oneshot service is mid-run
-      case $l in ''|-|'n/a') TN_NEXT[$name]=0 ;; *)
-        TN_NEXT[$name]=$(date -d "$l" +%s 2>/dev/null || echo 0) ;; esac
-    fi
-  done
-  (( NOW - timers_at >= 30 )) && timers_at=$NOW
-  return 0
 }
 
 render() {
-  [ -n "$CW" ] || CW=$(tput cols 2>/dev/null || echo "$HQ_WIDTH")
-  local cw=$CW tw=$((CW - 24)) buf plain i n=${#tid[@]} cc kc pct ps clock f meta d name
-  TZ=UTC0 printf -v clock '%(%H:%M:%SZ)T' -1
-  hoststats
-  buf="${E}[38;5;208;1mhq${R} $clock ${E}[38;5;244m$HOST${R}"
-  [ "$nav" = hqnav ] && buf+=" ${E}[1;38;5;226mnav${R}"
-  buf+=$'\n\n'"${E}[38;5;226mtabs${R}"$'\n'
-  (( n == 0 )) && buf+='  none'$'\n'
+  [ -n "$CW" ] || CW=$(tput cols 2>/dev/null || echo 60)
+  local cw=$CW tw=$((CW - 24)) buf plain i n=${#tid[@]} cc ps pct f meta rc rest end sum
+  TZ=UTC0 printf -v plain '%(%H:%M:%SZ)T' -1
+  buf="${E}[38;5;208;1mhq${R} $plain   ${E}[38;5;244m$n claude$( ((n==1)) || echo s)${R}"$'\n\n'
+  (( n == 0 )) && buf+='  no claude sessions running'$'\n'
   for i in "${!tid[@]}"; do
     pct=${tctx[i]}
     if (( pct < 0 )); then ps='--%' cc=244
     else ps="${pct}%"
-      if (( pct < 50 )); then cc=40; elif (( pct < 80 )); then cc=226; else cc=196; fi
+      if   (( pct < 50 )); then cc=40
+      elif (( pct < 80 )); then cc=226
+      else cc=196; fi
     fi
     if (( i == sel )); then
       printf -v plain '%d   %3s %-8.8s %4s %s' "$((i+1))" "${tage[i]}" "${tmdl[i]}" "$ps" "${ttitle[i]:0:tw}"
       printf -v plain ' %s[7m%-*s%s' "$E" "$((cw - 2))" "$plain" "$R"
     else
-      if is_robot "${tname[i]}"; then kc="${E}[38;5;208m"
-      elif [ "${tkind[i]}" = ln ]; then kc="${E}[38;5;244m"
-      else kc=''; fi
       printf -v plain ' %d %s %3s %s%-8.8s%s %s%4s%s %s%s%s' "$((i+1))" "${tglyph[i]}" "${tage[i]}" \
         "${E}[38;5;244m" "${tmdl[i]}" "$R" "${E}[38;5;${cc}m" "$ps" "$R" \
-        "$kc" "${ttitle[i]:0:tw}" "${kc:+$R}"
+        "$( ((trobot[i])) && printf '%s' "${E}[38;5;208m")" "${ttitle[i]:0:tw}" "$R"
     fi
     buf+=$plain$'\n'
   done
-  buf+=$'\n'"${E}[38;5;226mruns${R}"$'\n'
-  for f in "${runlogs[@]}"; do
-    meta=${R_META[$f]:-}
-    [ -n "$meta" ] || continue
-    local rc=${meta%%|*} rest=${meta#*|} end sum
-    end=${rest%%|*} sum=${rest#*|}
-    if [ "$rc" = live ]; then cc=226; dur_fmt $(( NOW - ${R_START[$f]:-NOW} ))
-    else
-      if [ "$rc" = 0 ]; then cc=40; else cc=196; fi
-      dur_fmt $(( end - ${R_START[$f]:-end} ))
-    fi
-    d=${f##*/}; d=${d%.log}; d=${d:17}
-    printf -v plain '  %s%4s%s %5s %s %s' "${E}[38;5;${cc}m" "$rc" "$R" "$g_df" "$d" "${sum:0:$((cw - 26))}"
-    buf+=$plain$'\n'
-  done
-  buf+=$'\n'"${E}[38;5;226mpoll${R}"$'\n'
-  for name in "${!PL_ROW[@]}"; do
-    age_fmt $(( NOW - ${PL_TS[$name]:-NOW} ))
-    printf -v plain '  %-3.3s %3s %s' "$name" "$g_af" "${PL_ROW[$name]:0:$((cw - 15))}"
-    if (( ${TN_NEXT[$name]:-0} > NOW )); then
-      age_fmt $(( ${TN_NEXT[$name]} - NOW ))
-      plain+=" ${E}[38;5;244m▸$g_af${R}"
-    fi
-    buf+=$plain$'\n'
-  done
+  if (( ${#runlogs[@]} )); then
+    buf+=$'\n'"${E}[38;5;226mrobot runs${R}"$'\n'
+    for f in "${runlogs[@]}"; do
+      meta=${R_META[$f]:-}; [ -n "$meta" ] || continue
+      rc=${meta%%|*}; rest=${meta#*|}; end=${rest%%|*}; sum=${rest#*|}
+      if [ "$rc" = live ]; then cc=226; dur_fmt $(( NOW - ${R_START[$f]:-NOW} ))
+      else
+        if [ "$rc" = 0 ]; then cc=40; else cc=196; fi
+        dur_fmt $(( end - ${R_START[$f]:-end} ))
+      fi
+      printf -v plain '  %s%4s%s %5s %s' "${E}[38;5;${cc}m" "$rc" "$R" "$g_df" "${sum:0:$((cw - 16))}"
+      buf+=$plain$'\n'
+    done
+  fi
   [ -n "$msg" ] && buf+=$'\n'"  ${E}[38;5;196m$msg${R}"$'\n'
-  (( help )) || buf+=$'\n'"${E}[38;5;244m j/k pick · enter open · q leave · ? keys${R}"$'\n'
   if (( help )); then
-    buf+=$'\n'"${E}[38;5;244m j/k gg G 1-9 move · enter/i type · n new"$'\n'
-    buf+=' x kill robot · r refresh · R restart · q leave'$'\n'
-    buf+=' M-q (C-b Tab) toggles hq in/out'$'\n'
-    buf+=' M-j/k or M-Space arm nav mode: bare'$'\n'
-    buf+=" j/k g G 1-9 switch tabs, i to type${R}"$'\n'
-  fi
-  printf '%s[H%s[2J%s\n' "$E" "$E" "$buf"
-}
-
-prev_narrow=0
-autozoom() {  # phone-sized clients get one full-screen pane at a time:
-  # below HQ_NARROW cols the active pane is kept zoomed (C-b o still flips —
-  # the other pane zooms as soon as it goes active). wide again → unzoom once.
-  # doubles as the liveness probe: display failing = hq window/session gone
-  local ww zf act
-  read -r ww zf act < <(tmux display -p -t "=$S:hq" '#{window_width} #{window_zoomed_flag} #{pane_id}' 2>/dev/null)
-  [ -n "${ww:-}" ] || return 1
-  if (( ww < HQ_NARROW )); then
-    prev_narrow=1
-    [ "$zf" = 0 ] && tmux resize-pane -Z -t "$act" 2>/dev/null
+    buf+=$'\n'"${E}[38;5;244m j/k  move        enter  jump to it"$'\n'
+    buf+=' gg/G 1-9 top/bottom/jump'$'\n'
+    buf+=' n    new claude in this session'$'\n'
+    buf+=" x    kill a robot run     q  close${R}"$'\n'
   else
-    (( prev_narrow )) && [ "$zf" = 1 ] && tmux resize-pane -Z -t "$act" 2>/dev/null
-    prev_narrow=0
+    buf+=$'\n'"${E}[38;5;244m j/k pick · enter jump · n new · q close · ? keys${R}"$'\n'
   fi
-  return 0
+  printf '%s[H%s[2J%s' "$E" "$E" "$buf"
 }
 
-preview() { [ -n "${tid[sel]:-}" ] && tmux select-window -t "${tid[sel]}" 2>/dev/null; return 0; }
-
-focus() {
-  [ -n "${tid[sel]:-}" ] || return 0
+jump() {  # go to the selected claude in the caller's own client, then close
+  [ -n "${tid[sel]:-}" ] || return 1
   tmux select-window -t "${tid[sel]}" 2>/dev/null
-  tmux select-pane -t "$(rpane)" 2>/dev/null
-  autozoom
+  tmux select-pane -t "${tpane[sel]}" 2>/dev/null
+  tmux switch-client -t "${tsess[sel]}" 2>/dev/null
   return 0
 }
 
-killtab() {
+killrun() {
   local k pid
-  if [ "${tkind[sel]:-}" != in ] || ! is_robot "${tname[sel]:-}"; then
-    msg='x kills robots only'; render; return 0
-  fi
+  if (( ! ${trobot[sel]:-0} )); then msg='x kills robot runs only'; render; return 0; fi
   msg="kill ${tname[sel]}? y/N"; render
   IFS= read -rsn1 -t 5 k || k=''
   msg=''
@@ -587,128 +326,90 @@ killtab() {
   scan; render
 }
 
-flush() {  # r key: forget everything cached and rebuild from disk
-  T_FILE=() T_SLUG=() T_MTIME=() T_MODEL=() T_CTX=() MT=()
-  R_META=() R_MT=() R_START=() PL_ROW=() PL_TS=() PL_MT=() TN_NEXT=()
-  runlogs=() runs_sig='' hook_sig='' timers_at=0
-}
-
-handle() {
-  local key=$1 k2
-  if [ "$key" = "$E" ]; then
-    read -rsn2 -t 0.01 k2 || k2=''
-    case "$k2" in '[A') key=k ;; '[B') key=j ;; *) return 0 ;; esac
-  fi
-  msg=''
-  case "$key" in
-    j) (( sel < ${#tid[@]} - 1 )) && { ((sel++)); sel_id=${tid[sel]}; preview; }; render ;;
-    k) (( sel > 0 )) && { ((sel--)); sel_id=${tid[sel]}; preview; }; render ;;
-    g) read -rsn1 -t 0.5 k2 || k2=''
-       [ "$k2" = g ] && { sel=0; sel_id=${tid[0]:-}; preview; render; } ;;
-    G) (( ${#tid[@]} )) && { sel=$(( ${#tid[@]} - 1 )); sel_id=${tid[sel]}; preview; }; render ;;
-    [1-9]) (( key <= ${#tid[@]} )) && { sel=$((key - 1)); sel_id=${tid[sel]}; preview; focus; }; render ;;
-    ''|l|i) focus ;;
-    $'\f') scan; runs_scan; poll_scan; render ;;   # C-l poke from the hook
-    n) newtab || ensure
-       scan; render ;;
-    x) killtab ;;
-    r) flush; scan; runs_scan; poll_scan; render ;;
-    q) back ;;
-    R) tmux run-shell -b "$SELF restart" 2>/dev/null ;;
-    '?') help=$(( 1 - help )); render ;;
-  esac
-  return 0
-}
-
 board() {
-  [ -t 0 ] || { echo 'hq board: needs a tty' >&2; exit 1; }
+  [ -t 0 ] || { echo 'hq board: needs a tty (run "hq")' >&2; exit 1; }
   trap 'stty sane 2>/dev/null; printf "\e[?25h"' EXIT INT TERM
-  # WINCH lands during read -rsn1 -t1 as rc>128, indistinguishable from the
-  # timeout — which is fine: the next loop pass re-renders with fresh cols
   trap 'CW=' WINCH
   printf '\e[?25l'
-  local key rc last
-  scan; runs_scan; poll_scan; render; last=$SECONDS
+  local key k2 rc last
+  scan; runs_scan; render; last=$SECONDS
   while :; do
-    autozoom || { printf '\nhq session gone\n'; exit 1; }
-    if (( SECONDS - last >= HQ_TICK )); then
-      scan; runs_scan; poll_scan; render; last=$SECONDS
-    fi
+    if (( SECONDS - last >= HQ_TICK )); then scan; runs_scan; render; last=$SECONDS; fi
     key=''
     IFS= read -rsn1 -t 1 key
     rc=$?
-    if (( rc == 0 )); then handle "$key"
-    elif (( rc <= 128 )); then exit 1   # stdin gone; timeout/signal is >128
+    if (( rc > 128 )); then continue; fi        # timeout or signal
+    (( rc == 0 )) || exit 0                     # stdin gone
+    if [ "$key" = "$E" ]; then                  # arrows, and esc closes
+      read -rsn2 -t 0.02 k2 || { exit 0; }
+      case "$k2" in '[A') key=k ;; '[B') key=j ;; *) continue ;; esac
     fi
+    msg=''
+    case "$key" in
+      j) (( sel < ${#tid[@]} - 1 )) && ((sel++)); render ;;
+      k) (( sel > 0 )) && ((sel--)); render ;;
+      g) read -rsn1 -t 0.5 k2 || k2=''
+         [ "$k2" = g ] && { sel=0; render; } ;;
+      G) (( ${#tid[@]} )) && sel=$(( ${#tid[@]} - 1 )); render ;;
+      [1-9]) (( key <= ${#tid[@]} )) && { sel=$((key - 1)); jump && exit 0; }; render ;;
+      ''|l) jump && exit 0; render ;;
+      n) tmux new-window -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null; exit 0 ;;
+      x) killrun ;;
+      r) scan; runs_scan; render ;;
+      q) exit 0 ;;
+      '?') help=$(( 1 - help )); render ;;
+    esac
   done
 }
 
-# -------------------------------------------------------------- launcher ----
+# ------------------------------------------------------------- launcher ----
+
+binds() {  # the real bindings belong in tmux.conf (they must survive a server
+  # restart — see README). this only clears keys hq itself grabbed before it
+  # stopped being a session you live in.
+  local i
+  for i in j k l n q h Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
+  tmux unbind -a -T hqnav 2>/dev/null
+  tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null; tmux unbind Tab 2>/dev/null
+  tmux bind Space next-layout 2>/dev/null   # restore stock prefix-Space
+  return 0
+}
+
+unmigrate() {  # leave no trace of the old two-session shape: hand adopted
+  # windows back to their home sessions, undo the options hq set on them,
+  # and drop the hq session.
+  # NB: unlink-window MUST name the session ("hqx:@22"), not the bare window
+  # id — a bare id unlinks from whichever session tmux resolves first, which
+  # is how an early version yanked windows out of the user's own session.
+  # tmux refuses to unlink a window's last link, which is the safety we want.
+  local wid
+  while read -r wid; do
+    [ -n "$wid" ] || continue
+    tmux unlink-window -t "=$X:$wid" 2>/dev/null
+    tmux set -w -t "$wid" -u window-size 2>/dev/null
+    tmux set -w -t "$wid" -u aggressive-resize 2>/dev/null
+    tmux set -w -t "$wid" -u @hqlink 2>/dev/null
+  done < <(tmux list-windows -a -F '#{window_id} #{@hqlink}' 2>/dev/null | awk '$2==1{print $1}')
+  tmux has-session -t "=$S" 2>/dev/null && tmux kill-session -t "=$S" 2>/dev/null
+  return 0
+}
 
 case "${1:-}" in
+  bar)   bar ;;
   board) board ;;
-  view)  view ;;
   hooks) hooks ;;
-  newtab) newtab ;;
-  nth) nth "${2:-1}" ;;
-  restart)  # rebuild board + viewer; claudes (hqx) untouched. clients that
-    # were on hq get kicked by the kill — bring them back afterwards.
-    mapfile -t RCL < <(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null)
-    tmux kill-session -t "=$S" 2>/dev/null
-    "$SELF" </dev/null >/dev/null 2>&1 || true
-    for c in ${RCL[@]+"${RCL[@]}"}; do tmux switch-client -c "$c" -t "=$S" 2>/dev/null; done
-    if [ -t 0 ] && [ -z "${TMUX:-}" ]; then exec tmux attach -t "=$S"; fi
-    echo 'hq: restarted' ;;
-  kill)  # full teardown: ui first (else the viewer loop resurrects hqx),
-    # then hqx. adopted claudes survive in their home sessions; hq-native
-    # tabs and live robot runs die with hqx. timers keep polling headless.
-    tmux kill-session -t "=$S" 2>/dev/null
-    tmux kill-session -t "=$X" 2>/dev/null
-    echo 'hq: gone (adopted claudes live on in their own sessions)' ;;
+  popup) tmux display-popup -E -w 86% -h 80% -T ' hq ' "$SELF board" ;;
+  setup) unmigrate; binds; echo 'hq: ready — C-b h opens the board' ;;
+  kill)  unmigrate
+         tmux kill-session -t "=$X" 2>/dev/null
+         echo 'hq: robot session gone; your claudes are untouched' ;;
   '')
-    migrate
-    ensure
+    unmigrate
     binds
-    tmux has-session -t "=$S" 2>/dev/null ||
-      tmux new-session -d -s "$S" -n hq "$RUN board"
-    # heal by IDENTITY, not pane count: if the board pane died, blindly
-    # splitting a viewer would leave two viewers and no board
-    has_board='' has_view=''
-    while IFS= read -r pcmd; do
-      case $pcmd in *' board'*) has_board=1 ;; *' view'*) has_view=1 ;; esac
-    done < <(tmux list-panes -t "=$S:hq" -F '#{pane_start_command}' 2>/dev/null)
-    if [ -z "$has_view" ]; then
-      tmux split-window -h -t "=$S:hq" "$RUN view"
-      tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
+    if [ -n "${TMUX:-}" ]; then
+      exec tmux display-popup -E -w 86% -h 80% -T ' hq ' "$SELF board"
     fi
-    if [ -z "$has_board" ]; then
-      tmux split-window -hb -t "=$S:hq" "$RUN board"
-      tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
-    fi
-    # same smallest-active-viewer rule as adopted windows — a phone and a
-    # desktop can both be on hq
-    tmux set -w -t "$S:hq" window-size smallest 2>/dev/null
-    tmux set -w -t "$S:hq" aggressive-resize on 2>/dev/null
-    # the outer status line IS the tab strip (fed by the board via @hqtabs) —
-    # tab feedback that survives the zoomed single-pane phone layout
-    tmux set -t "$S:" status on 2>/dev/null
-    tmux set -t "$S:" status-interval 2 2>/dev/null
-    tmux set -t "$S:" status-style 'fg=white,bg=black' 2>/dev/null
-    tmux set -t "$S:" status-left '#{E:@hqtabs}' 2>/dev/null
-    tmux set -t "$S:" status-left-length 300 2>/dev/null
-    tmux set -t "$S:" status-right '' 2>/dev/null
-    tmux set -w -t "$S:hq" window-status-format '' 2>/dev/null
-    tmux set -w -t "$S:hq" window-status-current-format '' 2>/dev/null
-    # entering hq lands on the BOARD — it is the home screen. on narrow
-    # clients that means a fullscreen board; enter dives into the selected
-    # claude fullscreen, C-b o flips back. M-l / enter reach the input on
-    # wide screens too.
-    tmux select-pane -t "$(lpane)" 2>/dev/null
-    if [ -t 0 ]; then
-      if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$S"
-      else exec tmux attach -t "=$S"; fi
-    fi
-    echo "hq: sessions ready (no tty — attach with: tmux attach -t $S)"
+    exec "$SELF" board
     ;;
-  *) echo 'usage: hq [restart|kill|board|view|hooks|newtab|nth N]' >&2; exit 2 ;;
+  *) echo 'usage: hq [bar|setup|hooks|kill] — plain "hq" (or C-b h) opens the board' >&2; exit 2 ;;
 esac
