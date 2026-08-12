@@ -175,6 +175,12 @@ the tmux traps this thing walks around, for the next person:
   the command strings.
 - **argless grep eats your loop**: `grep $(ls ...)` with no matches reads
   the enclosing while-read's stdin and silently swallows the rest of it.
+- **`window-size latest` silently ignores aggressive-resize**: a window
+  shared across sessions keeps the biggest client's size and small
+  viewers see it clipped — the bottom of the claude UI (input + status)
+  falls off a phone screen. `window-size smallest` + `aggressive-resize
+  on` is the working combo: sized to the smallest viewer *actively
+  looking at it*, so an idle big client elsewhere doesn't clamp it.
 - **instant bar sync without polling**: a `set-hook after-select-window`
   on the inner session sends `C-l` to the board pane — the board's read
   loop treats it as a rescan poke.

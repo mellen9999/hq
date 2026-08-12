@@ -310,8 +310,13 @@ scan() {
       case $'\n'$hqids$'\n' in *$'\n'$wid$'\n'*) continue ;; esac
       tmux link-window -d -s "$wid" -t "=$X:" 2>/dev/null || continue
       tmux set -w -t "$wid" @hqlink 1 2>/dev/null
-      # without this a small hq client would clamp the window in its home
-      # session too; with it the window sizes to wherever it is active
+      # a shared window must fit its smallest ACTIVE viewer or the bottom of
+      # the claude UI (input + status) falls off the small screen. NB: the
+      # default window-size "latest" silently IGNORES aggressive-resize —
+      # smallest + aggressive is the working combo (aggressive scopes
+      # "smallest" to sessions where the window is current, so an idle big
+      # client elsewhere doesn't clamp it)
+      tmux set -w -t "$wid" window-size smallest 2>/dev/null
       tmux set -w -t "$wid" aggressive-resize on 2>/dev/null
       hqids="$hqids"$'\n'"$wid"
     done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_current_command}|#{pane_title}' 2>/dev/null)
