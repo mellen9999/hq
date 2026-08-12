@@ -3,6 +3,7 @@
 # and robot ones — is a tab in a left column. j/k to move, enter to type.
 #
 #   hq          build sessions if needed and attach
+#   hq restart  rebuild board + viewer; claudes untouched
 #   hq board    (internal) the left-pane tab board
 #   hq view     (internal) the right-pane viewer loop
 #   hq hooks    print the claude code hooks snippet for status glyphs
@@ -13,11 +14,14 @@
 set -u
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
+# shellcheck source=/dev/null
 [ -f "$CONF/hqrc" ] && . "$CONF/hqrc"
-: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_WIDTH:=46}" "${HQ_TICK:=2}" "${HQ_NARROW:=100}"
+: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_WIDTH:=46}" "${HQ_TICK:=2}" \
+  "${HQ_NARROW:=100}" "${HQ_CTX:=200000}"
 S="${HQ_SESSION:-hq}"
 X="${S}x"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hq"
+STATED="${XDG_RUNTIME_DIR:-/tmp}/hq/state"
 SELF=$(realpath "$0")
 # pane commands run with the server's env, not ours — bake the session name in
 RUN="HQ_SESSION=$(printf '%q' "$S") exec $(printf '%q' "$SELF")"
@@ -144,56 +148,155 @@ EOF
 }
 
 # ---------------------------------------------------------------- board ----
-
-hdr() { printf '\n%s[38;5;226m%s%s\n' "$E" "$1" "$R"; }
-
-# title slug → transcript file, cached (grep across transcripts only on miss).
-# several sessions can share one project dir; the pane title's task slug
-# appears in exactly one transcript, so this stays per-pane accurate.
-CACHE="${XDG_RUNTIME_DIR:-/tmp}/hq-tcache"
-
-tfile() {
-  local f t
-  f=$(awk -F'\t' -v k="$1|$2" '$1==k{print $2; exit}' "$CACHE")
-  if [ -z "$f" ] || [ ! -f "$f" ]; then
-    t=$(ls -t "$1"/*.jsonl 2>/dev/null | head -12)
-    # no transcripts → no grep: argless grep would eat the caller's stdin
-    [ -n "$t" ] && f=$(grep -lF -- "$2" $t 2>/dev/null | head -1) || f=''
-    [ -n "$f" ] && printf '%s|%s\t%s\n' "$1" "$2" "$f" >> "$CACHE"
-  fi
-  printf '%s' "$f"
-}
-
-model_for() {  # $1 = pane cwd, $2 = pane title
-  local d f slug
-  d="$HOME/.claude/projects/$(printf '%s' "$1" | tr '/.' '--')"
-  slug="${2#* }"
-  f=''
-  [ -n "$slug" ] && [ "$slug" != "Claude Code" ] && f=$(tfile "$d" "$slug")
-  [ -z "$f" ] && f=$(ls -t "$d"/*.jsonl 2>/dev/null | head -1)
-  [ -n "$f" ] && tail -c 20000 "$f" | grep -oE '"model":"claude-[^"]*"' | tail -1 \
-    | sed 's/.*"claude-//; s/"//'
-}
-
-glyph() {  # $1 = pane id → hook-reported state, empty if hooks not wired
-  local f="${XDG_RUNTIME_DIR:-/tmp}/hq/state/$1"
-  [ -f "$f" ] || { printf ' '; return; }
-  case "$(cut -d' ' -f1 "$f" 2>/dev/null)" in
-    working) printf '%s[38;5;40m●%s' "$E" "$R" ;;
-    waiting) printf '%s[1;38;5;226m◐%s' "$E" "$R" ;;
-    done)    printf '%s[38;5;244m○%s' "$E" "$R" ;;
-    *)       printf ' ' ;;
-  esac
-}
+# perf model: the board is one long-lived process, so all caches are assoc
+# arrays in memory. per tick: a few tmux calls + ONE batched stat; transcripts
+# and logs are re-read only when their mtime moved. steady-state idle tick
+# runs zero grep/awk/tail.
 
 is_robot() { [[ "$1" =~ ^[a-z]+-[0-9]{6}$ ]]; }
 
-declare -a tid tkind tname tpane tlabel
-sel=0 sel_id='' help=0 msg='' last_act='' nav=''
+declare -A T_FILE T_SLUG T_MTIME T_MODEL T_CTX   # per pane: transcript probe
+declare -A MT                                     # path → mtime (batched stat)
+declare -A R_META R_MT R_START                    # run log → "rc|start|end", parse mtime, start epoch
+declare -A PL_ROW PL_TS PL_MT TN_NEXT             # robot → poll msg / its epoch / log mtime / next fire
+declare -a tid tkind tname tpane ttitle tmdl tctx tglyph tage
+declare -a runlogs=()
+sel=0 sel_id='' help=0 msg='' last_act='' nav='' NOW=0 CW='' HOST=''
+runs_sig='' hook_sig='' timers_at=0 g_glyph=' ' g_age='' g_af='' g_df=''
+
+# one awk pass per changed transcript gets model AND context tokens.
+# ctx = input + cache_creation + cache_read of the last main-chain usage
+# block — NOT every *_tokens field: output_tokens and the nested
+# cache_creation.ephemeral_* object would double-count. the [{,] boundary
+# stops input_tokens from matching inside cache_*_input_tokens. sidechain
+# (subagent) turns are skipped — their tiny ctx would lie about the session.
+# shellcheck disable=SC2016  # single quotes are the point: awk source, not shell
+AWK_PROBE='
+function tok(s, k) { return match(s, "[{,]\"" k "\":[0-9]+") ? substr(s, RSTART + length(k) + 4, RLENGTH - length(k) - 4) + 0 : 0 }
+{
+  if (match($0, /"model":"claude-[^"]*"/)) m = substr($0, RSTART + 9, RLENGTH - 10)
+  if ($0 !~ /"isSidechain":true/ && match($0, /"usage":\{[^}]*/)) {
+    u = substr($0, RSTART, RLENGTH)
+    c = tok(u, "input_tokens") + tok(u, "cache_creation_input_tokens") + tok(u, "cache_read_input_tokens")
+  }
+}
+END { print (m ? m : "-"), c + 0 }
+'
+
+age_fmt() {  # $1 seconds → g_af, ≤3 chars
+  local s=$1; (( s < 0 )) && s=0
+  if   (( s < 100 ));    then g_af="${s}s"
+  elif (( s < 6000 ));   then g_af="$((s / 60))m"
+  elif (( s < 172800 )); then g_af="$((s / 3600))h"
+  else                        g_af="$((s / 86400))d"; fi
+}
+
+dur_fmt() {  # $1 seconds → g_df, ≤5 chars
+  local s=$1; (( s < 0 )) && s=0
+  if   (( s < 60 ));   then g_df="${s}s"
+  elif (( s < 600 ));  then printf -v g_df '%dm%02ds' $((s / 60)) $((s % 60))
+  elif (( s < 3600 )); then g_df="$((s / 60))m"
+  else                      printf -v g_df '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60)); fi
+}
+
+short_model() {  # claude-opus-4-7 → opus47 (strip vendor, dates, dashes)
+  local m=${1#claude-}
+  m=${m%-2[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*}
+  printf -v g_sm '%s' "${m//-/}"
+}
+
+ctx_max() {  # $1 model → g_cm context window; HQ_CTX covers unknown models
+  case $1 in
+    *haiku*)                            g_cm=200000 ;;
+    *fable*|*mythos*|*opus*|*sonnet*)   g_cm=1000000 ;;
+    *)                                  g_cm=$HQ_CTX ;;
+  esac
+}
+
+hoststats() {  # /proc only, zero forks; empty off linux
+  local l _ k v mt=0 ma=0
+  [ -r /proc/loadavg ] || { HOST=''; return 0; }
+  read -r l _ < /proc/loadavg
+  while read -r k v _; do
+    case $k in MemTotal:) mt=$v ;; MemAvailable:) ma=$v; break ;; esac
+  done < /proc/meminfo
+  HOST="$l $(( (mt - ma) / 1048576 ))/$(( mt / 1048576 ))G"
+}
+
+mstat() {  # ONE stat call for every watched file. safe unquoted expansion:
+  # transcript/state/log names are uuid/timestamp/pane-id — never whitespace
+  local -a fl=()
+  local p m
+  MT=()
+  for p in "${!T_FILE[@]}"; do [ -n "${T_FILE[$p]}" ] && fl+=("${T_FILE[$p]}"); done
+  for p in "${tpane[@]}"; do fl+=("$STATED/$p"); done
+  for p in "$STATE"/*/runs "$STATE"/*/poll.log "${runlogs[@]}"; do fl+=("$p"); done
+  (( ${#fl[@]} )) || return 0
+  while read -r m p; do MT[$p]=$m; done < <(stat -c '%Y %n' "${fl[@]}" 2>/dev/null)
+  return 0
+}
+
+resolve() {  # $1 pane, $2 project dir, $3 slug → T_FILE/T_SLUG. several
+  # sessions can share one project dir; the title slug appears in exactly
+  # one transcript, so this stays per-pane accurate. negative results cache
+  # too (T_SLUG set, T_FILE empty) — retried only when the slug changes.
+  local -a t
+  local f=''
+  if [ -n "$3" ] && [ "$3" != "Claude Code" ]; then
+    # shellcheck disable=SC2012  # mtime order is the point; names are safe
+    mapfile -t t < <(ls -t "$2"/*.jsonl 2>/dev/null | head -12)
+    (( ${#t[@]} )) && f=$(grep -lF -- "$3" "${t[@]}" 2>/dev/null | head -1)
+  fi
+  # shellcheck disable=SC2012
+  [ -n "$f" ] || f=$(ls -t "$2"/*.jsonl 2>/dev/null | head -1)
+  T_SLUG[$1]=$3
+  T_FILE[$1]=$f
+}
+
+probe() {  # $1 pane, $2 pane cwd, $3 slug → T_MODEL/T_CTX, mtime-gated
+  local p=$1 q d f m c
+  f=${T_FILE[$p]:-}
+  if [ -z "${T_SLUG[$p]+x}" ] || [ "$3" != "${T_SLUG[$p]}" ] ||
+     { [ -n "$f" ] && [ -z "${MT[$f]:-}" ]; }; then
+    q=${2//\//-}; q=${q//./-}
+    d="$HOME/.claude/projects/$q"
+    resolve "$p" "$d" "$3"
+    f=${T_FILE[$p]:-}
+    [ -n "$f" ] && MT[$f]=$(stat -c %Y "$f" 2>/dev/null)
+  fi
+  [ -n "$f" ] || { T_MODEL[$p]='' T_CTX[$p]=0; return 0; }
+  if [ "${MT[$f]:-0}" != "${T_MTIME[$p]:-}" ]; then
+    read -r m c < <(tail -c 20000 "$f" | awk "$AWK_PROBE")
+    T_MODEL[$p]=${m:--} T_CTX[$p]=${c:-0} T_MTIME[$p]=${MT[$f]:-0}
+  fi
+  return 0
+}
+
+tabstate() {  # $1 pane, $2 transcript → g_glyph g_age, forkless. the state
+  # file mtime IS the state timestamp (hq-status rewrites it per event);
+  # hookless tabs fall back to transcript mtime = last-activity age.
+  local f="$STATED/$1" st _ ref=''
+  g_glyph=' ' g_age=''
+  if [ -n "${MT[$f]:-}" ]; then
+    read -r st _ < "$f" 2>/dev/null || st=''
+    case $st in
+      working) g_glyph="${E}[38;5;40m●${R}" ;;
+      waiting) g_glyph="${E}[1;38;5;226m◐${R}" ;;
+      done)    g_glyph="${E}[38;5;244m○${R}" ;;
+    esac
+    ref=${MT[$f]}
+  elif [ -n "${2:-}" ] && [ -n "${MT[$2]:-}" ]; then
+    ref=${MT[$2]}
+  fi
+  if [ -n "$ref" ]; then age_fmt $(( NOW - ref )); g_age=$g_af; fi
+  return 0
+}
 
 scan() {
-  tid=() tkind=() tname=() tpane=() tlabel=()
-  local wid name act lnk pid cmd path title sess m i cur_act='' hqids
+  tid=() tkind=() tname=() tpane=() ttitle=() tmdl=() tctx=() tglyph=() tage=()
+  local wid name act lnk pid cmd path title sess i p cur_act='' hqids ids='' pct
+  local -a paths=() slugs=()
+  NOW=$EPOCHSECONDS
   # adopt: link every claude window elsewhere on the server into hqx — a
   # linked window IS the same window, so its tab is live and typeable, and
   # j/k covers every claude with zero session-hopping. HQ_LINK=0 disables.
@@ -204,13 +307,13 @@ scan() {
       # claude either owns the tty (cmd=claude) or sits behind a wrapper
       # shell — then its title glyph (✳ / braille spinner) gives it away
       case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *) continue ;; esac
-      printf '%s\n' "$hqids" | grep -qx "$wid" && continue
+      case $'\n'$hqids$'\n' in *$'\n'$wid$'\n'*) continue ;; esac
       tmux link-window -d -s "$wid" -t "=$X:" 2>/dev/null || continue
       tmux set -w -t "$wid" @hqlink 1 2>/dev/null
       # without this a small hq client would clamp the window in its home
       # session too; with it the window sizes to wherever it is active
       tmux set -w -t "$wid" aggressive-resize on 2>/dev/null
-      hqids=$(printf '%s\n%s' "$hqids" "$wid")
+      hqids="$hqids"$'\n'"$wid"
     done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_current_command}|#{pane_title}' 2>/dev/null)
   fi
   while IFS='|' read -r wid name act lnk pid cmd path title; do
@@ -219,21 +322,44 @@ scan() {
       case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *)
         tmux unlink-window -t "=$X:$wid" 2>/dev/null && continue ;; esac
     fi
-    tid+=("$wid") tname+=("$name") tpane+=("$pid")
+    tid+=("$wid") tname+=("$name") tpane+=("$pid") paths+=("$path")
+    slugs+=("${title#* }")
     [ "$lnk" = 1 ] && tkind+=(ln) || tkind+=(in)
     [ "$act" = 1 ] && cur_act=$wid
-    m=$(model_for "$path" "$title" </dev/null)
-    tlabel+=("$(printf '%-10.10s %-9.9s %s' "$name" "${m:--}" "$title")")
+    ids+=" $wid"
   done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{window_active}|#{@hqlink}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  mstat
+  for i in "${!tid[@]}"; do
+    p=${tpane[i]}
+    probe "$p" "${paths[i]}" "${slugs[i]}"
+    if is_robot "${tname[i]}"; then ttitle[i]=${tname[i]}; else ttitle[i]=${slugs[i]}; fi
+    short_model "${T_MODEL[$p]:--}"; tmdl[i]=$g_sm
+    ctx_max "${T_MODEL[$p]:-}"
+    pct=$(( ${T_CTX[$p]:-0} * 100 / g_cm ))
+    (( pct > 99 )) && pct=99
+    (( ${T_CTX[$p]:-0} == 0 )) && pct=-1
+    tctx[i]=$pct
+    tabstate "$p" "${T_FILE[$p]:-}"
+    tglyph[i]=$g_glyph tage[i]=$g_age
+  done
+  for p in "${!T_FILE[@]}"; do   # sweep cache entries for panes that are gone
+    case " ${tpane[*]:-} " in *" $p "*) ;; *)
+      unset "T_FILE[$p]" "T_SLUG[$p]" "T_MTIME[$p]" "T_MODEL[$p]" "T_CTX[$p]" ;;
+    esac
+  done
   # M-j/M-k switch hqx windows without touching the board — follow them
   if [ -n "$cur_act" ] && [ "$cur_act" != "$last_act" ]; then
     last_act=$cur_act
     sel_id=$cur_act
   fi
   nav=$(tmux list-clients -t "=$S" -F '#{client_key_table}' 2>/dev/null | head -1)
-  # select-window anywhere in hqx pokes us (C-l) for an instant bar update
-  tmux set-hook -t "$X:" after-select-window \
-    "run-shell \"tmux send-keys -t '$TMUX_PANE' C-l 2>/dev/null\"" 2>/dev/null
+  # select-window anywhere in hqx pokes us (C-l) for an instant bar update;
+  # re-assert only when the window set changed (hqx may have been recreated)
+  if [ "$ids" != "$hook_sig" ]; then
+    hook_sig=$ids
+    tmux set-hook -t "$X:" after-select-window \
+      "run-shell \"tmux send-keys -t '$TMUX_PANE' C-l 2>/dev/null\"" 2>/dev/null
+  fi
   local found=''
   if [ -n "$sel_id" ]; then
     for i in "${!tid[@]}"; do [ "${tid[i]}" = "$sel_id" ] && { sel=$i; found=1; break; }; done
@@ -245,50 +371,123 @@ scan() {
   fi
 }
 
+runs_scan() {  # refresh run rows; forks only when something actually changed
+  local d f b rc ts sum l sig=''
+  for d in "$STATE"/*/runs; do sig+="${MT[$d]:-} "; done
+  if [ "$sig" != "$runs_sig" ]; then
+    runs_sig=$sig
+    # shellcheck disable=SC2012
+    mapfile -t runlogs < <(ls -t "$STATE"/*/runs/*.log 2>/dev/null | head -8)
+    for f in "${runlogs[@]}"; do
+      [ -n "${MT[$f]:-}" ] || MT[$f]=$(stat -c %Y "$f" 2>/dev/null)
+    done
+  fi
+  for f in "${runlogs[@]}"; do
+    if [ -z "${R_START[$f]:-}" ]; then
+      b=${f##*/}   # YYYYmmddTHHMMSSZ-name.log → epoch (date -d chokes on the
+      # compact form; reformat via substrings first)
+      R_START[$f]=$(date -ud "${b:0:4}-${b:4:2}-${b:6:2} ${b:9:2}:${b:11:2}:${b:13:2}Z" +%s 2>/dev/null || echo 0)
+    fi
+    [ "${MT[$f]:-0}" = "${R_MT[$f]:-}" ] && continue
+    R_MT[$f]=${MT[$f]:-0}
+    rc='' ts='' sum=''
+    while IFS= read -r l; do case $l in '# exit '*) rc=$l ;; esac; done < <(tail -c 200 "$f" 2>/dev/null)
+    while IFS= read -r l; do case $l in '#'*|'') ;; *) sum=$l; break ;; esac; done < "$f"
+    if [ -n "$rc" ]; then
+      read -r _ _ rc ts _ <<<"$rc"
+      ts=$(date -ud "${ts:-}" +%s 2>/dev/null || echo "$NOW")
+      R_META[$f]="$rc|$ts|$sum"
+    else
+      R_META[$f]="live|0|$sum"
+    fi
+  done
+  return 0
+}
+
+poll_scan() {  # poll tails + robot next-fire, mtime/interval gated
+  local d name p l ts
+  for d in "$STATE"/*/; do
+    d=${d%/}; name=${d##*/}
+    p="$d/poll.log"
+    [ -n "${MT[$p]:-}" ] || continue
+    if [ "${MT[$p]}" != "${PL_MT[$name]:-}" ]; then
+      PL_MT[$name]=${MT[$p]}
+      l=$(tail -n1 "$p" 2>/dev/null)
+      ts=${l%% *}
+      PL_TS[$name]=$(date -ud "$ts" +%s 2>/dev/null || echo "$NOW")
+      PL_ROW[$name]=${l#* }
+    fi
+    if (( NOW - timers_at >= 30 )) && [ -d /run/systemd/system ]; then
+      l=$(systemctl --user show "hq-$name.timer" -p NextElapseUSecRealtime --value 2>/dev/null)
+      # transiently empty/'-' while the oneshot service is mid-run
+      case $l in ''|-|'n/a') TN_NEXT[$name]=0 ;; *)
+        TN_NEXT[$name]=$(date -d "$l" +%s 2>/dev/null || echo 0) ;; esac
+    fi
+  done
+  (( NOW - timers_at >= 30 )) && timers_at=$NOW
+  return 0
+}
+
 render() {
-  local cw buf i line n=${#tid[@]}
-  cw=$(tput cols 2>/dev/null || echo "$HQ_WIDTH")
-  buf=$(
-    printf '%s[38;5;208;1mhq%s %s%s\n' "$E" "$R" "$(date -u +%H:%M:%SZ)" \
-      "$([ "$nav" = hqnav ] && printf ' %s[1;38;5;226mnav%s' "$E" "$R")"
-
-    hdr tabs
-    (( n == 0 )) && printf '  none\n'
-    for i in "${!tid[@]}"; do
-      line=$(printf '%d %s' "$((i+1))" "${tlabel[i]}")
-      line=$(printf '%s' "$line" | cut -c1-$((cw - 3)))
-      if (( i == sel )); then
-        printf ' %s[7m%-*s%s\n' "$E" "$((cw - 2))" "$line" "$R"
-      elif is_robot "${tname[i]}"; then
-        printf ' %s %s[38;5;208m%s%s\n' "$(glyph "${tpane[i]}")" "$E" "$line" "$R"
-      elif [ "${tkind[i]}" = ln ]; then
-        printf ' %s %s[38;5;244m%s%s\n' "$(glyph "${tpane[i]}")" "$E" "$line" "$R"
-      else
-        printf ' %s %s\n' "$(glyph "${tpane[i]}")" "$line"
-      fi
-    done
-
-    hdr runs
-    ls -t "$STATE"/*/runs/*.log 2>/dev/null | head -8 | while IFS= read -r f; do
-      rc=$(awk '/^# exit /{print $3}' "$f")
-      if [ -z "$rc" ]; then c=226 rc=live
-      elif [ "$rc" = 0 ]; then c=40
-      else c=196; fi
-      printf '  %s[38;5;%sm%4s%s %s %s\n' "$E" "$c" "$rc" "$R" \
-        "$(basename "$f" .log | cut -c10-)" \
-        "$(grep -m1 -v '^#' "$f" | cut -c1-$((cw - 28)))"
-    done
-
-    hdr poll
-    local p
-    for p in "$STATE"/*/poll.log; do
-      [ -f "$p" ] || continue
-      tail -n1 "$p" | sed "s|^|  $(basename "$(dirname "$p")" | cut -c1-3) |" | cut -c1-"$cw"
-    done
-
-    [ -n "$msg" ] && printf '\n  %s[38;5;196m%s%s\n' "$E" "$msg" "$R"
-    (( help )) && printf '\n%s[38;5;244m j/k gg G 1-9 move · enter/i type · n new\n x kill robot · r refresh · q detach\n M-j/k or M-Space arm nav mode: bare\n j/k g G 1-9 switch tabs, i to type%s\n' "$E" "$R"
-  )
+  [ -n "$CW" ] || CW=$(tput cols 2>/dev/null || echo "$HQ_WIDTH")
+  local cw=$CW tw=$((CW - 24)) buf plain i n=${#tid[@]} cc kc pct ps clock f meta d name
+  TZ=UTC0 printf -v clock '%(%H:%M:%SZ)T' -1
+  hoststats
+  buf="${E}[38;5;208;1mhq${R} $clock ${E}[38;5;244m$HOST${R}"
+  [ "$nav" = hqnav ] && buf+=" ${E}[1;38;5;226mnav${R}"
+  buf+=$'\n\n'"${E}[38;5;226mtabs${R}"$'\n'
+  (( n == 0 )) && buf+='  none'$'\n'
+  for i in "${!tid[@]}"; do
+    pct=${tctx[i]}
+    if (( pct < 0 )); then ps='--%' cc=244
+    else ps="${pct}%"
+      if (( pct < 50 )); then cc=40; elif (( pct < 80 )); then cc=226; else cc=196; fi
+    fi
+    if (( i == sel )); then
+      printf -v plain '%d   %3s %-8.8s %4s %s' "$((i+1))" "${tage[i]}" "${tmdl[i]}" "$ps" "${ttitle[i]:0:tw}"
+      printf -v plain ' %s[7m%-*s%s' "$E" "$((cw - 2))" "$plain" "$R"
+    else
+      if is_robot "${tname[i]}"; then kc="${E}[38;5;208m"
+      elif [ "${tkind[i]}" = ln ]; then kc="${E}[38;5;244m"
+      else kc=''; fi
+      printf -v plain ' %d %s %3s %s%-8.8s%s %s%4s%s %s%s%s' "$((i+1))" "${tglyph[i]}" "${tage[i]}" \
+        "${E}[38;5;244m" "${tmdl[i]}" "$R" "${E}[38;5;${cc}m" "$ps" "$R" \
+        "$kc" "${ttitle[i]:0:tw}" "${kc:+$R}"
+    fi
+    buf+=$plain$'\n'
+  done
+  buf+=$'\n'"${E}[38;5;226mruns${R}"$'\n'
+  for f in "${runlogs[@]}"; do
+    meta=${R_META[$f]:-}
+    [ -n "$meta" ] || continue
+    local rc=${meta%%|*} rest=${meta#*|} end sum
+    end=${rest%%|*} sum=${rest#*|}
+    if [ "$rc" = live ]; then cc=226; dur_fmt $(( NOW - ${R_START[$f]:-NOW} ))
+    else
+      if [ "$rc" = 0 ]; then cc=40; else cc=196; fi
+      dur_fmt $(( end - ${R_START[$f]:-end} ))
+    fi
+    d=${f##*/}; d=${d%.log}; d=${d:17}
+    printf -v plain '  %s%4s%s %5s %s %s' "${E}[38;5;${cc}m" "$rc" "$R" "$g_df" "$d" "${sum:0:$((cw - 26))}"
+    buf+=$plain$'\n'
+  done
+  buf+=$'\n'"${E}[38;5;226mpoll${R}"$'\n'
+  for name in "${!PL_ROW[@]}"; do
+    age_fmt $(( NOW - ${PL_TS[$name]:-NOW} ))
+    printf -v plain '  %-3.3s %3s %s' "$name" "$g_af" "${PL_ROW[$name]:0:$((cw - 15))}"
+    if (( ${TN_NEXT[$name]:-0} > NOW )); then
+      age_fmt $(( ${TN_NEXT[$name]} - NOW ))
+      plain+=" ${E}[38;5;244m▸$g_af${R}"
+    fi
+    buf+=$plain$'\n'
+  done
+  [ -n "$msg" ] && buf+=$'\n'"  ${E}[38;5;196m$msg${R}"$'\n'
+  if (( help )); then
+    buf+=$'\n'"${E}[38;5;244m j/k gg G 1-9 move · enter/i type · n new"$'\n'
+    buf+=' x kill robot · r refresh · q detach'$'\n'
+    buf+=' M-j/k or M-Space arm nav mode: bare'$'\n'
+    buf+=" j/k g G 1-9 switch tabs, i to type${R}"$'\n'
+  fi
   printf '%s[H%s[2J%s\n' "$E" "$E" "$buf"
 }
 
@@ -296,10 +495,10 @@ prev_narrow=0
 autozoom() {  # phone-sized clients get one full-screen pane at a time:
   # below HQ_NARROW cols the active pane is kept zoomed (C-b o still flips —
   # the other pane zooms as soon as it goes active). wide again → unzoom once.
+  # doubles as the liveness probe: display failing = hq window/session gone
   local ww zf act
-  set -- $(tmux display -p -t "=$S:hq" '#{window_width} #{window_zoomed_flag} #{pane_id}' 2>/dev/null)
-  ww=${1:-} zf=${2:-} act=${3:-}
-  [ -n "$ww" ] || return 0
+  read -r ww zf act < <(tmux display -p -t "=$S:hq" '#{window_width} #{window_zoomed_flag} #{pane_id}' 2>/dev/null)
+  [ -n "${ww:-}" ] || return 1
   if (( ww < HQ_NARROW )); then
     prev_narrow=1
     [ "$zf" = 0 ] && tmux resize-pane -Z -t "$act" 2>/dev/null
@@ -336,6 +535,12 @@ killtab() {
   scan; render
 }
 
+flush() {  # r key: forget everything cached and rebuild from disk
+  T_FILE=() T_SLUG=() T_MTIME=() T_MODEL=() T_CTX=() MT=()
+  R_META=() R_MT=() R_START=() PL_ROW=() PL_TS=() PL_MT=() TN_NEXT=()
+  runlogs=() runs_sig='' hook_sig='' timers_at=0
+}
+
 handle() {
   local key=$1 k2
   if [ "$key" = "$E" ]; then
@@ -351,11 +556,11 @@ handle() {
     G) (( ${#tid[@]} )) && { sel=$(( ${#tid[@]} - 1 )); sel_id=${tid[sel]}; preview; }; render ;;
     [1-9]) (( key <= ${#tid[@]} )) && { sel=$((key - 1)); sel_id=${tid[sel]}; preview; focus; }; render ;;
     ''|l|i) focus ;;
-    $'\f') scan; render ;;   # C-l poke from the after-select-window hook
+    $'\f') scan; runs_scan; poll_scan; render ;;   # C-l poke from the hook
     n) newtab || ensure
        scan; render ;;
     x) killtab ;;
-    r) : > "$CACHE"; scan; render ;;
+    r) flush; scan; runs_scan; poll_scan; render ;;
     q) tmux detach-client -s "=$S" 2>/dev/null ;;
     '?') help=$(( 1 - help )); render ;;
   esac
@@ -364,23 +569,23 @@ handle() {
 
 board() {
   [ -t 0 ] || { echo 'hq board: needs a tty' >&2; exit 1; }
-  touch "$CACHE"
   trap 'stty sane 2>/dev/null; printf "\e[?25h"' EXIT INT TERM
+  # WINCH lands during read -rsn1 -t1 as rc>128, indistinguishable from the
+  # timeout — which is fine: the next loop pass re-renders with fresh cols
+  trap 'CW=' WINCH
   printf '\e[?25l'
   local key rc last
-  scan; render; last=$SECONDS
+  scan; runs_scan; poll_scan; render; last=$SECONDS
   while :; do
-    tmux has-session -t "=$S" 2>/dev/null || { printf '\nhq session gone\n'; exit 1; }
-    autozoom
+    autozoom || { printf '\nhq session gone\n'; exit 1; }
     if (( SECONDS - last >= HQ_TICK )); then
-      [ "$(wc -l < "$CACHE")" -gt 200 ] && : > "$CACHE"
-      scan; render; last=$SECONDS
+      scan; runs_scan; poll_scan; render; last=$SECONDS
     fi
     key=''
     IFS= read -rsn1 -t 1 key
     rc=$?
     if (( rc == 0 )); then handle "$key"
-    elif (( rc <= 128 )); then exit 1   # stdin gone; timeout is >128
+    elif (( rc <= 128 )); then exit 1   # stdin gone; timeout/signal is >128
     fi
   done
 }

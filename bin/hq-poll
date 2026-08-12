@@ -8,6 +8,7 @@ set -u
 usage() { echo 'usage: hq-poll [-t] <robot>' >&2; exit 2; }
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
+# shellcheck source=/dev/null
 [ -f "$CONF/hqrc" ] && . "$CONF/hqrc"
 : "${HQ_DIR:=$HOME}"
 S="${HQ_SESSION:-hq}"
@@ -41,6 +42,7 @@ mkdir -p "$RUNS"
 ts() { date -u +%FT%TZ; }
 log() { echo "$(ts) $*" >> "$POLL_LOG"; }
 
+# shellcheck disable=SC1090  # user robot config, path by design
 . "$ROBOT"
 [ -n "$PREFIX" ] || { echo "hq-poll: $NAME: PREFIX unset" >&2; exit 1; }
 
@@ -107,6 +109,7 @@ touch "$LOCK"
 # the window — the tab shows live work. rc via file, not PIPESTATUS: the exit
 # stamp must be claude's code, never tee's. trap covers reap's TERM + HUP/INT
 # so a killed run still releases the lock (bash skips EXIT on untrapped fatals).
+# shellcheck disable=SC2016  # job.sh lines expand at run time, not here
 {
   echo '#!/bin/bash'
   printf 'trap %s EXIT HUP TERM INT\n' "'rm -f $(printf '%q' "$LOCK")'"

@@ -1,4 +1,5 @@
 # example hq robot — watch a log for errors, spawn claude to investigate.
+# shellcheck shell=bash disable=SC2034  # vars are consumed by hq-poll after sourcing
 # copy to ~/.config/hq/robots/<name>.sh, then: hq-poll <name> (or -t for a timer)
 
 PREFIX=err                # tabs appear as err-HHMMSS; only err-* is ever reaped
