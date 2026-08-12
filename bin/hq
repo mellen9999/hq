@@ -1,0 +1,316 @@
+#!/bin/bash
+# hq — mission control for claude code in tmux. every running claude — yours
+# and robot ones — is a tab in a left column. j/k to move, enter to type.
+#
+#   hq          build sessions if needed and attach
+#   hq board    (internal) the left-pane tab board
+#   hq view     (internal) the right-pane viewer loop
+#   hq hooks    print the claude code hooks snippet for status glyphs
+#
+# layout: outer session "hq" holds the board (left) and a viewer pane (right)
+# attached to inner session "hqx", where every window is one claude. selecting
+# a tab is just select-window on hqx — the viewer follows instantly.
+set -u
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
+[ -f "$CONF/hqrc" ] && . "$CONF/hqrc"
+: "${HQ_DIR:=$HOME}" "${HQ_CMD:=claude}" "${HQ_WIDTH:=46}" "${HQ_TICK:=2}"
+S="${HQ_SESSION:-hq}"
+X="${S}x"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hq"
+SELF=$(realpath "$0")
+# pane commands run with the server's env, not ours — bake the session name in
+RUN="HQ_SESSION=$(printf '%q' "$S") exec $(printf '%q' "$SELF")"
+E=$'\e'
+R="${E}[0m"
+
+ensure() {  # inner session up; race-safe against hq-poll doing the same
+  tmux has-session -t "=$X" 2>/dev/null ||
+    tmux new-session -d -s "$X" -n main -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null
+  # detach-on-destroy: if hqx dies the viewer client must detach, never fall
+  # into another session (it would nest hq inside hq); the view loop respawns.
+  # "$X:" not "=$X" — set-option rejects the exact-match prefix
+  tmux set -t "$X:" status off 2>/dev/null
+  tmux set -t "$X:" detach-on-destroy on 2>/dev/null
+  return 0
+}
+
+lpane() { tmux list-panes -t "=$S:hq" -F '#{pane_left} #{pane_id}' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2; }
+rpane() { tmux list-panes -t "=$S:hq" -F '#{pane_left} #{pane_id}' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2; }
+
+migrate() {  # one-time: pre-tab shape had claude running directly in pane 2
+  tmux has-session -t "=$S" 2>/dev/null || return 0
+  [ "$(tmux list-panes -t "=$S:hq" 2>/dev/null | wc -l)" -ge 2 ] || return 0
+  local rp wid name
+  rp=$(rpane)
+  # new shape iff the right pane was started as our viewer (current_command is
+  # useless here — it reports the wrapper shell, not the attached tmux client)
+  case "$(tmux display -p -t "$rp" '#{pane_start_command}' 2>/dev/null)" in
+    *' view') return 0 ;;
+  esac
+  # move the live claude pane into hqx unharmed; create hqx around it if needed
+  if tmux has-session -t "=$X" 2>/dev/null; then
+    tmux break-pane -d -s "$rp" -t "=$X:" -n main
+  else
+    local tmp
+    tmp=$(tmux new-session -dP -F '#{window_id}' -s "$X" -n hqtmp 'sleep 30')
+    tmux break-pane -d -s "$rp" -t "=$X:" -n main
+    [ -n "$tmp" ] && tmux kill-window -t "$tmp" 2>/dev/null
+  fi
+  # stray robot windows ride along
+  tmux list-windows -t "=$S" -F '#{window_id} #{window_name}' | while read -r wid name; do
+    [ "$name" = hq ] && continue
+    tmux move-window -d -s "$wid" -t "=$X:" 2>/dev/null
+  done
+  # old board loop → this board
+  tmux respawn-pane -k -t "$(lpane)" "$RUN board" 2>/dev/null
+}
+
+view() {  # right pane: live window of hqx; self-heals if hqx dies
+  while :; do
+    ensure
+    env -u TMUX tmux attach -t "=$X"
+    sleep 1
+  done
+}
+
+hooks() {
+  cat <<'EOF'
+merge into ~/.claude/settings.json for status glyphs on the board
+(working ● / waiting ◐ / done ○), optional:
+
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "hq-status working" }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "hq-status working" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "hq-status waiting" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "hq-status done" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "hq-status gone" }] }]
+  }
+}
+EOF
+}
+
+# ---------------------------------------------------------------- board ----
+
+hdr() { printf '\n%s[38;5;226m%s%s\n' "$E" "$1" "$R"; }
+
+# title slug → transcript file, cached (grep across transcripts only on miss).
+# several sessions can share one project dir; the pane title's task slug
+# appears in exactly one transcript, so this stays per-pane accurate.
+CACHE="${XDG_RUNTIME_DIR:-/tmp}/hq-tcache"
+
+tfile() {
+  local f t
+  f=$(awk -F'\t' -v k="$1|$2" '$1==k{print $2; exit}' "$CACHE")
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    t=$(ls -t "$1"/*.jsonl 2>/dev/null | head -12)
+    # no transcripts → no grep: argless grep would eat the caller's stdin
+    [ -n "$t" ] && f=$(grep -lF -- "$2" $t 2>/dev/null | head -1) || f=''
+    [ -n "$f" ] && printf '%s|%s\t%s\n' "$1" "$2" "$f" >> "$CACHE"
+  fi
+  printf '%s' "$f"
+}
+
+model_for() {  # $1 = pane cwd, $2 = pane title
+  local d f slug
+  d="$HOME/.claude/projects/$(printf '%s' "$1" | tr '/.' '--')"
+  slug="${2#* }"
+  f=''
+  [ -n "$slug" ] && [ "$slug" != "Claude Code" ] && f=$(tfile "$d" "$slug")
+  [ -z "$f" ] && f=$(ls -t "$d"/*.jsonl 2>/dev/null | head -1)
+  [ -n "$f" ] && tail -c 20000 "$f" | grep -oE '"model":"claude-[^"]*"' | tail -1 \
+    | sed 's/.*"claude-//; s/"//'
+}
+
+glyph() {  # $1 = pane id → hook-reported state, empty if hooks not wired
+  local f="${XDG_RUNTIME_DIR:-/tmp}/hq/state/$1"
+  [ -f "$f" ] || { printf ' '; return; }
+  case "$(cut -d' ' -f1 "$f" 2>/dev/null)" in
+    working) printf '%s[38;5;40m●%s' "$E" "$R" ;;
+    waiting) printf '%s[1;38;5;226m◐%s' "$E" "$R" ;;
+    done)    printf '%s[38;5;244m○%s' "$E" "$R" ;;
+    *)       printf ' ' ;;
+  esac
+}
+
+is_robot() { [[ "$1" =~ ^[a-z]+-[0-9]{6}$ ]]; }
+
+declare -a tid tkind tname tpane tlabel
+sel=0 sel_id='' help=0 msg=''
+
+scan() {
+  tid=() tkind=() tname=() tpane=() tlabel=()
+  local wid name pid cmd path title sess widx m i
+  while IFS='|' read -r wid name pid cmd path title; do
+    tid+=("$wid") tkind+=(in) tname+=("$name") tpane+=("$pid")
+    m=$(model_for "$path" "$title" </dev/null)
+    tlabel+=("$(printf '%-10.10s %-9.9s %s' "$name" "${m:--}" "$title")")
+  done < <(tmux list-windows -t "=$X" -F '#{window_id}|#{window_name}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  while IFS='|' read -r sess widx pid cmd path title; do
+    case "$sess" in "$S"|"$X") continue ;; esac
+    # claude either owns the tty (cmd=claude) or sits behind a wrapper
+    # shell — then its title glyph (✳ / braille spinner) gives it away
+    case "$cmd:$title" in claude:*|*:✳*|*:[⠀-⣿]*) ;; *) continue ;; esac
+    tid+=("$sess:$widx") tkind+=(ex) tname+=("$sess:$widx") tpane+=("$pid")
+    m=$(model_for "$path" "$title" </dev/null)
+    tlabel+=("$(printf '%-10.10s %-9.9s %s' "$sess:$widx" "${m:--}" "$title")")
+  done < <(tmux list-panes -a -F '#{session_name}|#{window_index}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  local found=''
+  if [ -n "$sel_id" ]; then
+    for i in "${!tid[@]}"; do [ "${tid[i]}" = "$sel_id" ] && { sel=$i; found=1; break; }; done
+  fi
+  if [ -z "$found" ]; then
+    (( sel >= ${#tid[@]} )) && sel=$(( ${#tid[@]} - 1 ))
+    (( sel < 0 )) && sel=0
+    sel_id=${tid[sel]:-}
+  fi
+}
+
+render() {
+  local cw buf i line n=${#tid[@]}
+  cw=$(tput cols 2>/dev/null || echo "$HQ_WIDTH")
+  buf=$(
+    printf '%s[38;5;208;1mhq%s %s\n' "$E" "$R" "$(date -u +%H:%M:%SZ)"
+
+    hdr tabs
+    (( n == 0 )) && printf '  none\n'
+    for i in "${!tid[@]}"; do
+      line=$(printf '%d %s%s' "$((i+1))" "${tlabel[i]}" "$([ "${tkind[i]}" = ex ] && printf ' ext')")
+      line=$(printf '%s' "$line" | cut -c1-$((cw - 3)))
+      if (( i == sel )); then
+        printf ' %s[7m%-*s%s\n' "$E" "$((cw - 2))" "$line" "$R"
+      elif is_robot "${tname[i]}"; then
+        printf ' %s %s[38;5;208m%s%s\n' "$(glyph "${tpane[i]}")" "$E" "$line" "$R"
+      elif [ "${tkind[i]}" = ex ]; then
+        printf ' %s %s[38;5;244m%s%s\n' "$(glyph "${tpane[i]}")" "$E" "$line" "$R"
+      else
+        printf ' %s %s\n' "$(glyph "${tpane[i]}")" "$line"
+      fi
+    done
+
+    hdr runs
+    ls -t "$STATE"/*/runs/*.log 2>/dev/null | head -8 | while IFS= read -r f; do
+      rc=$(awk '/^# exit /{print $3}' "$f")
+      if [ -z "$rc" ]; then c=226 rc=live
+      elif [ "$rc" = 0 ]; then c=40
+      else c=196; fi
+      printf '  %s[38;5;%sm%4s%s %s %s\n' "$E" "$c" "$rc" "$R" \
+        "$(basename "$f" .log | cut -c10-)" \
+        "$(grep -m1 -v '^#' "$f" | cut -c1-$((cw - 28)))"
+    done
+
+    hdr poll
+    local p
+    for p in "$STATE"/*/poll.log; do
+      [ -f "$p" ] || continue
+      tail -n1 "$p" | sed "s|^|  $(basename "$(dirname "$p")" | cut -c1-3) |" | cut -c1-"$cw"
+    done
+
+    [ -n "$msg" ] && printf '\n  %s[38;5;196m%s%s\n' "$E" "$msg" "$R"
+    (( help )) && printf '\n%s[38;5;244m j/k gg G 1-9 move · enter type · n new\n x kill robot · r refresh · q detach%s\n' "$E" "$R"
+  )
+  printf '%s[H%s[2J%s\n' "$E" "$E" "$buf"
+}
+
+preview() { [ "${tkind[sel]:-}" = in ] && tmux select-window -t "${tid[sel]}" 2>/dev/null; return 0; }
+
+focus() {
+  local c
+  if [ "${tkind[sel]:-}" = in ]; then
+    tmux select-window -t "${tid[sel]}" 2>/dev/null
+    tmux select-pane -t "$(rpane)" 2>/dev/null
+  elif [ "${tkind[sel]:-}" = ex ]; then
+    c=$(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null | head -1)
+    [ -n "$c" ] && tmux switch-client -c "$c" -t "${tid[sel]}" 2>/dev/null
+  fi
+  return 0
+}
+
+killtab() {
+  local k pid
+  if [ "${tkind[sel]:-}" != in ] || ! is_robot "${tname[sel]:-}"; then
+    msg='x kills robots only'; render; return 0
+  fi
+  msg="kill ${tname[sel]}? y/N"; render
+  IFS= read -rsn1 -t 5 k || k=''
+  msg=''
+  [ "$k" = y ] || { render; return 0; }
+  pid=$(tmux display -p -t "${tid[sel]}" '#{pane_pid}' 2>/dev/null)
+  # TERM the pane's process group first — kill-window's HUP only reaches the
+  # shell, which defers its trap while claude runs; the tree would survive
+  [ -n "$pid" ] && { kill -TERM -- "-$pid" 2>/dev/null; sleep 2; tmux kill-window -t "${tid[sel]}" 2>/dev/null; } &
+  scan; render
+}
+
+handle() {
+  local key=$1 k2
+  if [ "$key" = "$E" ]; then
+    read -rsn2 -t 0.01 k2 || k2=''
+    case "$k2" in '[A') key=k ;; '[B') key=j ;; *) return 0 ;; esac
+  fi
+  msg=''
+  case "$key" in
+    j) (( sel < ${#tid[@]} - 1 )) && { ((sel++)); sel_id=${tid[sel]}; preview; }; render ;;
+    k) (( sel > 0 )) && { ((sel--)); sel_id=${tid[sel]}; preview; }; render ;;
+    g) read -rsn1 -t 0.5 k2 || k2=''
+       [ "$k2" = g ] && { sel=0; sel_id=${tid[0]:-}; preview; render; } ;;
+    G) (( ${#tid[@]} )) && { sel=$(( ${#tid[@]} - 1 )); sel_id=${tid[sel]}; preview; }; render ;;
+    [1-9]) (( key <= ${#tid[@]} )) && { sel=$((key - 1)); sel_id=${tid[sel]}; preview; focus; }; render ;;
+    ''|l) focus ;;
+    n) tmux new-window -d -t "=$X:" -c "$HQ_DIR" "$HQ_CMD; exec bash" 2>/dev/null || ensure
+       scan; render ;;
+    x) killtab ;;
+    r) : > "$CACHE"; scan; render ;;
+    q) tmux detach-client -s "=$S" 2>/dev/null ;;
+    '?') help=$(( 1 - help )); render ;;
+  esac
+  return 0
+}
+
+board() {
+  [ -t 0 ] || { echo 'hq board: needs a tty' >&2; exit 1; }
+  touch "$CACHE"
+  trap 'stty sane 2>/dev/null; printf "\e[?25h"' EXIT INT TERM
+  printf '\e[?25l'
+  local key rc last
+  scan; render; last=$SECONDS
+  while :; do
+    tmux has-session -t "=$S" 2>/dev/null || { printf '\nhq session gone\n'; exit 1; }
+    if (( SECONDS - last >= HQ_TICK )); then
+      [ "$(wc -l < "$CACHE")" -gt 200 ] && : > "$CACHE"
+      scan; render; last=$SECONDS
+    fi
+    key=''
+    IFS= read -rsn1 -t 1 key
+    rc=$?
+    if (( rc == 0 )); then handle "$key"
+    elif (( rc <= 128 )); then exit 1   # stdin gone; timeout is >128
+    fi
+  done
+}
+
+# -------------------------------------------------------------- launcher ----
+
+case "${1:-}" in
+  board) board ;;
+  view)  view ;;
+  hooks) hooks ;;
+  '')
+    migrate
+    ensure
+    tmux has-session -t "=$S" 2>/dev/null ||
+      tmux new-session -d -s "$S" -n hq "$RUN board"
+    if [ "$(tmux list-panes -t "=$S:hq" 2>/dev/null | wc -l)" -lt 2 ]; then
+      tmux split-window -h -t "=$S:hq" "$RUN view"
+      tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
+    fi
+    tmux select-pane -t "$(lpane)" 2>/dev/null
+    if [ -t 0 ]; then
+      if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$S"
+      else exec tmux attach -t "=$S"; fi
+    fi
+    echo "hq: sessions ready (no tty — attach with: tmux attach -t $S)"
+    ;;
+  *) echo 'usage: hq [board|view|hooks]' >&2; exit 2 ;;
+esac

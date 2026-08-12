@@ -1,0 +1,131 @@
+#!/bin/bash
+# hq-poll <name> — run one poll of robot <name>: reap stale runs, check for
+# work, spawn a headless claude in a tab of session hqx if there is any.
+# hq-poll -t <name> generates + enables a systemd user timer for it (or call
+# hq-poll from cron). robots are small bash config files — see robots/example.sh.
+set -u
+
+usage() { echo 'usage: hq-poll [-t] <robot>' >&2; exit 2; }
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hq"
+[ -f "$CONF/hqrc" ] && . "$CONF/hqrc"
+: "${HQ_DIR:=$HOME}"
+S="${HQ_SESSION:-hq}"
+X="${S}x"
+
+mode=run
+[ "${1:-}" = -t ] && { mode=timer; shift; }
+NAME="${1:-}"
+[ -n "$NAME" ] || usage
+ROBOT="$CONF/robots/$NAME.sh"
+[ -f "$ROBOT" ] || { echo "hq-poll: no robot config $ROBOT" >&2; exit 1; }
+
+# robot contract — config overrides these and defines check():
+#   PREFIX      window-name prefix; runs appear as "$PREFIX-HHMMSS" tabs and
+#               ONLY "$PREFIX-*" windows are ever reaped
+#   INTERVAL    systemd OnCalendar for -t (e.g. '*:0/5')
+#   DELAY       RandomizedDelaySec for -t
+#   DIR         claude cwd
+#   CLAUDE_ARGS bash array of extra claude flags (permission mode, allowlist)
+#   check()     prints the prompt on stdout iff there is work, else returns 1;
+#               $STATE dir, $POLL_LOG and log() are available inside
+PREFIX='' INTERVAL='' DELAY=0 LOCK_MIN=45 KEEP_DAYS=14
+REAP_S="${HQ_REAP_S:-2700}"
+DIR="$HQ_DIR"
+CLAUDE_ARGS=()
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hq/$NAME"
+RUNS="$STATE/runs"
+LOCK="$STATE/lock"
+POLL_LOG="$STATE/poll.log"
+mkdir -p "$RUNS"
+ts() { date -u +%FT%TZ; }
+log() { echo "$(ts) $*" >> "$POLL_LOG"; }
+
+. "$ROBOT"
+[ -n "$PREFIX" ] || { echo "hq-poll: $NAME: PREFIX unset" >&2; exit 1; }
+
+if [ "$mode" = timer ]; then
+  [ -n "$INTERVAL" ] || { echo "hq-poll: $NAME: INTERVAL unset" >&2; exit 1; }
+  ud="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$ud"
+  printf '[Unit]\nDescription=hq robot %s\n\n[Service]\nType=oneshot\nExecStart=%s %s\n' \
+    "$NAME" "$(realpath "$0")" "$NAME" > "$ud/hq-$NAME.service"
+  printf '[Unit]\nDescription=hq robot %s timer\n\n[Timer]\nOnCalendar=%s\nRandomizedDelaySec=%s\nPersistent=false\n\n[Install]\nWantedBy=timers.target\n' \
+    "$NAME" "$INTERVAL" "$DELAY" > "$ud/hq-$NAME.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "hq-$NAME.timer"
+  systemctl --user list-timers "hq-$NAME.timer" --no-pager
+  exit 0
+fi
+
+reap() {  # safety net: kill this robot's windows >REAP_S old, nothing else.
+  # TERM the pane's process group, not tmux kill-window: kill-window's HUP only
+  # reaches the shell, which defers its trap while claude runs — the tree would
+  # survive orphaned. pane_pid is the group leader (tmux setsids the pane).
+  # Age via ps etimes — tmux has no pane-creation-time format (an empty format
+  # var reads as 0 in arithmetic and would reap EVERYTHING).
+  local wid name pid age
+  tmux list-panes -s -t "=$X" -F '#{window_id} #{window_name} #{pane_pid}' 2>/dev/null |
+  while read -r wid name pid; do
+    case "$name" in "$PREFIX"-*) ;; *) continue ;; esac
+    age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$age" ] || continue
+    if [ "$age" -gt "$REAP_S" ]; then
+      kill -TERM -- "-$pid" 2>/dev/null
+      sleep 2
+      tmux kill-window -t "$wid" 2>/dev/null
+    fi
+  done
+  return 0
+}
+
+reap
+find "$RUNS" -type f -mtime +"$KEEP_DAYS" -delete 2>/dev/null
+
+# one run at a time; a lock older than LOCK_MIN no longer blocks new work
+if [ -e "$LOCK" ]; then
+  if [ -n "$(find "$LOCK" -mmin +"$LOCK_MIN" 2>/dev/null)" ]; then
+    rm -f "$LOCK"
+  else
+    exit 0
+  fi
+fi
+
+prompt=$(check) || exit 0
+[ -n "$prompt" ] || exit 0
+
+sid=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+win="$PREFIX-$(date +%H%M%S)"
+run="$RUNS/$(date -u +%Y%m%dT%H%M%SZ)-$win.log"
+printf '%s\n' "$prompt" > "$STATE/prompt.txt"
+printf '# session %s\n# resume: cd %s && claude --resume %s\n' "$sid" "$DIR" "$sid" > "$run"
+log "spawning $NAME $win sid=$sid"
+touch "$LOCK"
+
+# the window command runs via /bin/sh, so keep it trivial and put the real
+# work in a bash-quoted job script. claude's stdout tees into the run log AND
+# the window — the tab shows live work. rc via file, not PIPESTATUS: the exit
+# stamp must be claude's code, never tee's. trap covers reap's TERM + HUP/INT
+# so a killed run still releases the lock (bash skips EXIT on untrapped fatals).
+{
+  echo '#!/bin/bash'
+  printf 'trap %s EXIT HUP TERM INT\n' "'rm -f $(printf '%q' "$LOCK")'"
+  printf '{ claude -p'
+  for a in ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}; do printf ' %q' "$a"; done
+  printf ' --session-id %q <%q 2>&1; echo $? >%q; } | tee -a %q\n' \
+    "$sid" "$STATE/prompt.txt" "$STATE/rc" "$run"
+  printf 'rc=$(cat %q 2>/dev/null || echo 1); rm -f %q\n' "$STATE/rc" "$STATE/rc"
+  printf 'printf %s "$rc" "$(date -u +%%FT%%TZ)" >>%q\n' "'\\n# exit %s %s\\n'" "$run"
+  printf '[ "$rc" -eq 0 ] || { command -v notify-send >/dev/null 2>&1 && notify-send -u critical %q "rc=$rc %s"; true; }\n' \
+    "hq $NAME failed" "$run"
+} > "$STATE/job.sh"
+
+# race-safe when two robots fire with no hqx yet: the new-session loser
+# falls through to new-window
+if tmux new-session -d -s "$X" -n "$win" -c "$DIR" "exec bash '$STATE/job.sh'" 2>/dev/null; then
+  # "$X:" not "=$X" — set-option rejects the exact-match prefix
+  tmux set -t "$X:" status off 2>/dev/null
+  tmux set -t "$X:" detach-on-destroy on 2>/dev/null
+else
+  tmux new-window -d -t "=$X:" -n "$win" -c "$DIR" "exec bash '$STATE/job.sh'"
+fi
