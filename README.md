@@ -6,38 +6,44 @@ running several claude code sessions in tmux? tmux already shows you the
 sessions. what it can't tell you is **which one is blocked waiting on you**
 and **which one is about to run out of context**.
 
-hq is one status-line segment for exactly that, plus a runner for headless
-claude workers. no session to attach to, no window of yours gets touched.
+hq answers both in the tab bar you already read — nothing to open, nothing
+to attach to, no window of yours gets touched.
 
 ```
-[0]   ◐ auth-token-fix  ●2  91%          ← your normal status line
+[0]   1:mpv  2:claude  3:claude*                     91%
+                ↑         ↑                           ↑
+            yellow:    green:                    someone is nearly
+          waiting on   working                   out of context
+             you
 ```
 
-a claude is stuck on a permission prompt (its task name), two are working,
-one is at 91% context. nothing running → the segment is empty and your bar
-looks exactly like it did before.
+your tabs are coloured by what each claude is doing, the instant it
+changes. nothing running → your bar looks exactly like it always did.
 
 ## install
 
 ```
 git clone https://github.com/mellen9999/hq && cd hq && make install
-hq hooks          # prints the claude code hooks that power the states
+hq hooks          # prints both bits of config to paste
 ```
 
-then in `~/.tmux.conf`:
+`hq hooks` gives you the claude code hooks (they paint the tabs) and the
+three tmux lines that render them. requires tmux, bash 5, claude code on
+PATH.
 
-```tmux
-set -g status-left "[#S]   #($HOME/.local/bin/hq bar)"
-set -g status-left-length 60
-```
+## how it works
 
-requires tmux, bash 5, claude code on PATH.
+the hooks fire on state changes and set a per-window tmux option
+(`@hqstate`), which `window-status-format` colours. no polling, no daemon —
+the tab is already the right colour by the time you look at it. the hook
+does nothing at all when the state hasn't moved, which matters because
+`PreToolUse` runs on every single tool call.
 
-## what it costs
-
-one tmux call plus a few file reads, ~8ms, run on your status-interval.
-the context figure needs a transcript scan so it's cached for
-`HQ_BAR_TTL` (60s) rather than recomputed every tick.
+the one thing that can't be event-driven is context, since it lives in the
+session transcript. `hq bar` computes it on your status-interval (~8ms, one
+tmux call plus a few reads, cached for `HQ_BAR_TTL`) and prints a red
+percentage only past 80. it also fixes up any tab whose claude died without
+firing `SessionEnd`, so a crashed session can't leave a colour behind.
 
 ## robots
 

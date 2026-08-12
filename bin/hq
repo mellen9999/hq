@@ -83,11 +83,13 @@ pane_state() {  # $1 pane id → g_state (working|waiting|done|'')
 hooks() {
   # absolute path: hook commands run with the spawning claude's PATH, which
   # for robot panes is the tmux server's — ~/.local/bin may not be on it
-  local hs
+  local hs c
   hs="$(dirname "$SELF")/hq-status"
+  # NB: styles inside a #{?...} conditional must be space-separated
+  # (#[fg=yellow bold]) — a comma there is read as the conditional's separator
+  c='#{?#{==:#{@hqstate},waiting},#[fg=yellow bold],}#{?#{==:#{@hqstate},working},#[fg=green],}#I:#W#{?window_flags,#{window_flags}, }#[default]'
   cat <<EOF
-merge into ~/.claude/settings.json — this is what powers the waiting/working
-signal (without it you still get the context warning, just no states):
+1. merge into ~/.claude/settings.json:
 
 {
   "hooks": {
@@ -98,31 +100,34 @@ signal (without it you still get the context warning, just no states):
     "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "$hs gone" }] }]
   }
 }
+
+2. colour the tabs from it, in ~/.tmux.conf:
+
+set -g window-status-format "$c"
+set -g window-status-current-format "$c"
+set -g status-right "#($(dirname "$SELF")/hq bar)"
 EOF
 }
 
-# one segment for the status line, run every status-interval by every client:
-#   ◐ auth-fix   a claude is blocked on you (the whole point)
-#   ●2           two working
-#   91%          someone is near their context limit
-# cheap by construction: one tmux call plus state-file reads. context needs
-# a transcript scan, so it is cached for HQ_BAR_TTL seconds.
+# the tabs carry each session's state (the hooks paint them); the only thing
+# left that no single tab can tell you is that someone is about to run out of
+# context, so that is all this prints — and nothing at all when everyone is
+# comfortable. it doubles as the janitor for tabs whose claude died without
+# firing SessionEnd.
 bar() {
-  local sess _w pid cmd path title m c g_state g_tf g_cm
-  local wait_n=0 work_n=0 waitname='' maxpct=0 out=''
+  local sess wid pid cmd path title state m c g_state g_tf g_cm
+  local maxpct=0 want
   local now=$EPOCHSECONDS cache="$RUN/bar" cts=0 pane pct
-  local -A CPCT=()
+  local -A CPCT=() WANT=() CUR=()
   [ -r "$cache" ] && { read -r cts; while read -r pane pct; do CPCT[$pane]=$pct; done; } < "$cache"
   local fresh=1
   (( now - cts > HQ_BAR_TTL )) && fresh=''
-  while IFS='|' read -r sess _w pid cmd path title; do
-    [ "$sess" = "$X" ] && continue          # robots: not a "waiting on you"
+  while IFS='|' read -r sess wid pid cmd path title state; do
+    [ -n "${CUR[$wid]+x}" ] || CUR[$wid]=$state
+    [ "$sess" = "$X" ] && continue          # robots aren't tabs of yours
     is_claude "$cmd" "$title" || continue
     pane_state "$pid"
-    case $g_state in
-      waiting) (( wait_n++ )); [ -n "$waitname" ] || waitname=${title#* } ;;
-      working) (( work_n++ )) ;;
-    esac
+    case $g_state in waiting|working) WANT[$wid]=$g_state ;; *) WANT[$wid]='' ;; esac
     if [ -n "$fresh" ]; then
       pct=${CPCT[$pid]:-0}
     else
@@ -136,16 +141,21 @@ bar() {
       CPCT[$pid]=$pct
     fi
     (( pct > maxpct )) && maxpct=$pct
-  done < <(tmux list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
+  done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}|#{@hqstate}' 2>/dev/null)
   if [ -z "$fresh" ]; then
     mkdir -p "$RUN" 2>/dev/null
     { echo "$now"; for pane in "${!CPCT[@]}"; do echo "$pane ${CPCT[$pane]}"; done; } > "$cache" 2>/dev/null
   fi
-  (( wait_n )) && out+="#[fg=yellow,bold]◐ ${waitname:0:14}#[default] "
-  (( work_n )) && out+="#[fg=green]●$work_n#[default] "
-  (( maxpct >= 80 )) && out+="#[fg=red]${maxpct}%#[default] "
+  # only touch tmux when a tab is actually wrong: a crashed claude leaves its
+  # colour behind, and a hook can be missed
+  for wid in "${!CUR[@]}"; do
+    want=${WANT[$wid]:-}
+    [ "$want" = "${CUR[$wid]}" ] && continue
+    if [ -n "$want" ]; then tmux set -w -t "$wid" @hqstate "$want" 2>/dev/null
+    else tmux set -w -t "$wid" -u @hqstate 2>/dev/null; fi
+  done
   # tmux reads job output line-wise — a missing newline means it never appears
-  [ -n "$out" ] && printf '%s  \n' "$out"
+  (( maxpct >= 80 )) && printf '#[fg=red]%s%%#[default] \n' "$maxpct"
   return 0
 }
 

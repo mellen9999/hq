@@ -1,7 +1,10 @@
 #!/bin/bash
-# hq-status <working|waiting|done|gone> — claude code hook helper. records
-# per-pane agent state so the hq board can show glyphs; wire it up with the
-# snippet from `hq hooks`. always exits 0 — a hook must never block a tool.
+# hq-status <working|waiting|done|gone> — claude code hook helper. paints the
+# tmux tab this session lives in: sets the window's @hqstate option, which
+# window-status-format colours (see `hq hooks`). also records the state per
+# pane so `hq bar` can reconcile. always exits 0 — a hook must never block a
+# tool call, and it runs on every one of them, so it does nothing at all when
+# the state hasn't changed.
 set -u
 
 d="${XDG_RUNTIME_DIR:-/tmp}/hq/state"
@@ -10,10 +13,13 @@ ev="${1:-}"
 in=$(cat 2>/dev/null || true)
 [ -n "$p" ] || exit 0
 mkdir -p "$d" 2>/dev/null || exit 0
-find "$d" -type f -mmin +1440 -delete 2>/dev/null
 
 case "$ev" in
-  gone) rm -f "$d/$p"; exit 0 ;;
+  gone)
+    rm -f "$d/$p"
+    tmux set -w -t "$p" -u @hqstate 2>/dev/null
+    tmux refresh-client -S 2>/dev/null
+    exit 0 ;;
   working|waiting) ;;
   done)
     # Stop with live background tasks is still working
@@ -21,7 +27,14 @@ case "$ev" in
   *) exit 0 ;;
 esac
 
+# PreToolUse fires on every tool call and is almost always working→working:
+# skip the two tmux round trips unless the state actually moved
+read -r prev _ < "$d/$p" 2>/dev/null || prev=''
 printf '%s %s\n' "$ev" "$(date -u +%FT%TZ)" > "$d/$p" 2>/dev/null
+[ "$prev" = "$ev" ] && exit 0
+
+tmux set -w -t "$p" @hqstate "$ev" 2>/dev/null
+tmux refresh-client -S 2>/dev/null
 
 # a robot stuck on a prompt is a stalled unattended run — surface it
 if [ "$ev" = waiting ] && command -v notify-send >/dev/null 2>&1; then
