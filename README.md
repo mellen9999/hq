@@ -2,43 +2,20 @@
 
 [![ci](https://github.com/mellen9999/hq/actions/workflows/ci.yml/badge.svg)](https://github.com/mellen9999/hq/actions/workflows/ci.yml)
 
-running several claude code sessions in tmux? you can already see them —
-what you can't see is **which one is blocked waiting for you**, and how
-close each is to its context limit. hq puts that in the status line you
-already look at, and a popup board one keystroke away.
+running several claude code sessions in tmux? tmux already shows you the
+sessions. what it can't tell you is **which one is blocked waiting on you**
+and **which one is about to run out of context**.
 
-no extra tmux session, nothing to attach to or detach from, no window of
-yours gets moved.
+hq is one status-line segment for exactly that, plus a runner for headless
+claude workers. no session to attach to, no window of yours gets touched.
 
 ```
 [0]   ◐ auth-token-fix  ●2  91%          ← your normal status line
 ```
 
-a claude is blocked on you (its task name), two are working, and one is at
-91% context. when nothing is running the segment is empty and your bar
+a claude is stuck on a permission prompt (its task name), two are working,
+one is at 91% context. nothing running → the segment is empty and your bar
 looks exactly like it did before.
-
-`C-b h` opens the board over whatever you're doing:
-
-```
-hq 04:12:07Z   4 claudes
-
- 1 ◐ 12m opus5     44% auth-token-fix
- 2 ●  3s opus5     91% lossless-chat-archive
- 3 ○  4h haiku45    8% waydroid setup
- 4 ● 44s opus5     23% fix-083808
-
-── auth-token-fix
-● Running 1 shell command · 6m 23s…
-  ⎿  $ adb devices -l 2>&1 | head -5
-     (ctrl+g to run in background)
-
- j/k read · enter jump in · q close · ? keys
-```
-
-j/k walks the list and the bottom half is that session's **live output** —
-you read every claude without entering any of them. enter takes you to the
-selected one in your own tmux and closes the popup.
 
 ## install
 
@@ -47,35 +24,20 @@ git clone https://github.com/mellen9999/hq && cd hq && make install
 hq hooks          # prints the claude code hooks that power the states
 ```
 
-then add to `~/.tmux.conf`:
+then in `~/.tmux.conf`:
 
 ```tmux
 set -g status-left "[#S]   #($HOME/.local/bin/hq bar)"
 set -g status-left-length 60
-bind h run-shell -b "$HOME/.local/bin/hq popup"
 ```
 
-requires tmux >= 3.2 (popups), bash 5, claude code on PATH.
+requires tmux, bash 5, claude code on PATH.
 
-## what the columns mean
+## what it costs
 
-`state · age · model · context · task`
-
-- **● working / ◐ waiting / ○ done** — event-driven, from claude code
-  hooks (`hq hooks`). ◐ is the one that matters: that session is sitting
-  on a permission prompt burning your time. the age next to it is how long
-  it's been stuck. without hooks everything else still works, you just get
-  no states.
-- **context** — input + cache tokens of the session's last turn as a % of
-  that model's window (1M for opus/sonnet/fable-class, 200k haiku, else
-  `HQ_CTX`). green under 50, yellow under 80, red above — red means
-  compact it.
-- **task** — claude's own title for what it's doing, so you can tell two
-  sessions in the same repo apart.
-
-the bar is cheap on purpose: one tmux call plus a few file reads, ~8ms,
-with the context scan cached for `HQ_BAR_TTL` (60s) so it isn't re-read
-every tick.
+one tmux call plus a few file reads, ~8ms, run on your status-interval.
+the context figure needs a transcript scan so it's cached for
+`HQ_BAR_TTL` (60s) rather than recomputed every tick.
 
 ## robots
 
@@ -90,11 +52,11 @@ hq-poll -t <name>   generate + enable a systemd user timer
 ```
 
 runs live in their own detached session so they never clutter your window
-list; the board lists them and `enter` takes you to one mid-run. output
-tees to both the window and a log in `~/.local/state/hq/<name>/runs/`, each
-with a `# resume:` line. a stuck run is reaped after `REAP_S` (45min
-default): process group first, then window, and only windows matching that
-robot's own prefix.
+list. output tees to both the window and a log in
+`~/.local/state/hq/<name>/runs/`, each with a `# resume:` line so you can
+reopen the session. a stuck run is reaped after `REAP_S` (45min default):
+process group first, then window, and only windows matching that robot's
+own prefix.
 
 **pin the model in `CLAUDE_ARGS`.** a robot with no `--model` inherits
 whatever your interactive default happens to be — change it, or hit that
@@ -106,9 +68,6 @@ one-line error and nothing else to show for it.
 `~/.config/hq/hqrc` (sourced bash), all optional:
 
 ```
-HQ_DIR      cwd for new claude tabs         (default $HOME)
-HQ_CMD      command for new tabs            (default claude)
-HQ_TICK     board refresh seconds           (default 2)
 HQ_CTX      ctx window for unknown models   (default 200000)
 HQ_BAR_TTL  status-bar ctx cache seconds    (default 60)
 HQ_SESSION  name root; robots live in <name>x (default hq)
@@ -120,31 +79,25 @@ anything here.
 
 ## design notes
 
-tmux traps this walks around, for the next person:
+tmux and claude-transcript traps this walks around, for the next person:
 
-- **`unlink-window -t @22` unlinks from whichever session tmux resolves
-  first** — not the one you meant. always name it: `unlink-window -t
-  hqx:@22`. getting this wrong yanks windows out of the user's own
-  session. (tmux refuses to unlink a window's last link, which is the
-  safety net you want.)
 - **`display -p '#(cmd)'` never runs the job** — `#()` only executes in
   real status-line rendering, so it always looks broken when you test it
   that way. verify by a side effect (a file the command touches) instead.
 - **a `#()` job needs a trailing newline** — tmux reads job output
   line-wise, so `printf '%s'` with no `\n` shows up as nothing.
-- **`window-size latest` silently ignores aggressive-resize** — a window
-  shared across sessions keeps the biggest client's size and small
-  viewers see it clipped. `smallest` + `aggressive-resize on` is the
-  working combo.
+- **`pane_current_command` reports the wrapper shell**, not the child, so
+  a claude behind `claude; exec bash` reads as `bash` — the pane title's
+  spinner glyph is the reliable tell.
+- **`unlink-window -t @22` unlinks from whichever session tmux resolves
+  first**, not the one you meant. always name it: `unlink-window -t
+  hqx:@22`.
 - **killing a robot window orphans the tree** — kill-window's HUP only
   reaches the shell, which defers its trap while claude runs. TERM the
   pane's process *group* first, then kill the window.
 - **`ps -o etimes=` for pane age** — tmux has no pane-creation-time
   format, and an empty format var reads as 0 in arithmetic, which would
   reap everything.
-- **`pane_current_command` reports the wrapper shell**, not the child, so
-  a claude behind `claude; exec bash` reads as `bash` — the pane title's
-  spinner glyph is the reliable tell.
 - **argless grep eats your loop** — `grep $(ls ...)` with no matches reads
   the enclosing while-read's stdin and silently swallows the rest.
 - **context math**: sum exactly `input_tokens` +
@@ -153,3 +106,11 @@ tmux traps this walks around, for the next person:
   via `output_tokens` and the nested `cache_creation.ephemeral_*` object,
   and sidechain (subagent) turns report a tiny context that isn't the
   session's.
+
+## history
+
+this started as a full-screen board in its own tmux session, with tabs, a
+nested viewer and live previews. it was more interesting to build than to
+use: everything it showed, tmux already showed, and the parts it added
+cost a session switch to reach. the useful residue was one line of status
+bar. that's what's left.
