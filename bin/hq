@@ -184,15 +184,15 @@ bar() {
 # the popup: every claude on the machine, one row each. enter jumps to it in
 # your own tmux and closes. no separate session to live in.
 
-declare -a tid tsess tpane tname ttitle tmdl tctx tglyph tage trobot
+declare -a tid tsess tpane tname ttitle tmdl tctx tglyph tsym tage trobot
 declare -a runlogs=()
 declare -A R_META R_START
 sel=0 msg='' help=0 NOW=0 CW='' g_af='' g_df='' g_sm='' g_cm=0 g_tf=''
 g_state='' g_since=0 m='' c=''
 
 scan() {
-  tid=() tsess=() tpane=() tname=() ttitle=() tmdl=() tctx=() tglyph=() tage=() trobot=()
-  local sess wid win pid cmd path title pct glyph seen=''
+  tid=() tsess=() tpane=() tname=() ttitle=() tmdl=() tctx=() tglyph=() tsym=() tage=() trobot=()
+  local sess wid win pid cmd path title pct glyph sym seen=''
   NOW=$EPOCHSECONDS
   while IFS='|' read -r sess wid win pid cmd path title; do
     # a window linked into two sessions is listed once per session — same
@@ -220,12 +220,12 @@ scan() {
     tmdl+=("$g_sm") tctx+=("$pct")
     pane_state "$pid"
     case $g_state in
-      working) glyph="${E}[38;5;40m●${R}" ;;
-      waiting) glyph="${E}[1;38;5;226m◐${R}" ;;
-      done)    glyph="${E}[38;5;244m○${R}" ;;
-      *)       glyph=' ' ;;
+      working) sym='●' glyph="${E}[38;5;40m●${R}" ;;
+      waiting) sym='◐' glyph="${E}[1;38;5;226m◐${R}" ;;
+      done)    sym='○' glyph="${E}[38;5;244m○${R}" ;;
+      *)       sym=' ' glyph=' ' ;;
     esac
-    tglyph+=("$glyph")
+    tglyph+=("$glyph") tsym+=("$sym")
     if (( g_since )); then age_fmt $(( NOW - g_since )); tage+=("$g_af"); else tage+=(''); fi
   done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{window_name}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}' 2>/dev/null)
   (( sel >= ${#tid[@]} )) && sel=$(( ${#tid[@]} - 1 ))
@@ -269,8 +269,13 @@ render() {
       else cc=196; fi
     fi
     if (( i == sel )); then
-      printf -v plain '%d   %3s %-8.8s %4s %s' "$((i+1))" "${tage[i]}" "${tmdl[i]}" "$ps" "${ttitle[i]:0:tw}"
-      printf -v plain ' %s[7m%-*s%s' "$E" "$((cw - 2))" "$plain" "$R"
+      # the state symbol rides along uncoloured so reverse video renders it
+      # black on white; pad by character count (${#} is multibyte-aware —
+      # printf's %-*s pads by bytes and would cut the bar short)
+      printf -v plain '%d %s %3s %-8.8s %4s %s' "$((i+1))" "${tsym[i]}" "${tage[i]}" "${tmdl[i]}" "$ps" "${ttitle[i]:0:tw}"
+      local pad=$(( cw - 2 - ${#plain} )) sp=''
+      (( pad > 0 )) && printf -v sp '%*s' "$pad" ''
+      printf -v plain ' %s[7m%s%s%s' "$E" "$plain" "$sp" "$R"
     else
       printf -v plain ' %d %s %3s %s%-8.8s%s %s%4s%s %s%s%s' "$((i+1))" "${tglyph[i]}" "${tage[i]}" \
         "${E}[38;5;244m" "${tmdl[i]}" "$R" "${E}[38;5;${cc}m" "$ps" "$R" \
