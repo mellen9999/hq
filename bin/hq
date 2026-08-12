@@ -162,7 +162,7 @@ declare -A PL_ROW PL_TS PL_MT TN_NEXT             # robot → poll msg / its epo
 declare -a tid tkind tname tpane ttitle tmdl tctx tglyph tage
 declare -a runlogs=()
 sel=0 sel_id='' help=0 msg='' last_act='' nav='' NOW=0 CW='' HOST=''
-runs_sig='' hook_sig='' timers_at=0 g_glyph=' ' g_age='' g_af='' g_df=''
+runs_sig='' hook_sig='' timers_at=0 g_glyph=' ' g_age='' g_af='' g_df='' laststrip=''
 
 # one awk pass per changed transcript gets model AND context tokens.
 # ctx = input + cache_creation + cache_read of the last main-chain usage
@@ -369,6 +369,31 @@ scan() {
     (( sel < 0 )) && sel=0
     sel_id=${tid[sel]:-}
   fi
+  strip_update
+}
+
+strip_update() {  # tab strip in the OUTER status line: always visible, even
+  # with the viewer zoomed full-screen (phones) — j/k feedback without the
+  # board. content rides a user option; status-left expands it with #{E:}.
+  local s='' i t c
+  for i in "${!tid[@]}"; do
+    t=${ttitle[i]//\#/}
+    t=${t:0:10}
+    if (( i == sel )); then
+      s+="#[fg=black,bg=white] $((i + 1)) $t #[default] "
+    else
+      case ${tglyph[i]} in *◐*) s+='#[bold,fg=colour226]' ;; esac
+      s+="$((i + 1)) $t#[default]  "
+    fi
+  done
+  [ "$nav" = hqnav ] && s+='#[bold,fg=colour226]nav#[default]'
+  [ "$s" = "$laststrip" ] && return 0
+  laststrip=$s
+  tmux set -t "$S:" @hqtabs "$s" 2>/dev/null
+  for c in $(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null); do
+    tmux refresh-client -S -t "$c" 2>/dev/null
+  done
+  return 0
 }
 
 runs_scan() {  # refresh run rows; forks only when something actually changed
@@ -611,6 +636,16 @@ case "${1:-}" in
       tmux split-window -h -t "=$S:hq" "$RUN view"
       tmux resize-pane -t "$(lpane)" -x "$HQ_WIDTH"
     fi
+    # the outer status line IS the tab strip (fed by the board via @hqtabs) —
+    # tab feedback that survives the zoomed single-pane phone layout
+    tmux set -t "$S:" status on 2>/dev/null
+    tmux set -t "$S:" status-interval 2 2>/dev/null
+    tmux set -t "$S:" status-style 'fg=white,bg=black' 2>/dev/null
+    tmux set -t "$S:" status-left '#{E:@hqtabs}' 2>/dev/null
+    tmux set -t "$S:" status-left-length 300 2>/dev/null
+    tmux set -t "$S:" status-right '' 2>/dev/null
+    tmux set -w -t "$S:hq" window-status-format '' 2>/dev/null
+    tmux set -w -t "$S:hq" window-status-current-format '' 2>/dev/null
     # typing-first: cursor lives in the claude input; M-h hops to the board
     tmux select-pane -t "$(rpane)" 2>/dev/null
     if [ -t 0 ]; then
