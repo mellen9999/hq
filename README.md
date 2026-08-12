@@ -40,11 +40,17 @@ the cursor lives in the claude input — just type. these work from anywhere
 in the hq session, typing included (alt keys, scoped to hq only):
 
 ```
-M-j M-k   next / previous tab
+M-j M-k   next / previous tab — and arm nav mode
+M-Space   arm nav mode without moving
 M-1..9    jump to tab
 M-n       new claude tab
 M-h M-l   hop board <-> input
 ```
+
+nav mode is a sticky layer (vim normal, one level up): after M-j/M-k or
+M-Space, bare `j k g G 1-9 n` act on tabs — no modifier held. the first
+other key (vim habit: `i`) drops you back to typing; the board header
+shows `nav` while it's armed. claude's own esc/normal mode stays claude's.
 
 board keys (after M-h):
 

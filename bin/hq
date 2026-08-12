@@ -51,16 +51,31 @@ binds() {  # root-table keys, live even while typing in a claude. if-shell
   # everywhere else. HQ_BINDS=0 in hqrc removes them.
   local g="#{==:#{session_name},$S}" i
   if [ "${HQ_BINDS:-1}" != 1 ]; then
-    for i in j k h l n 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
+    for i in j k h l n Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
+    tmux unbind -a -T hqnav 2>/dev/null
     return 0
   fi
-  tmux bind -n M-j if -F "$g" "next-window -t '$X:'"     "send-keys M-j"
-  tmux bind -n M-k if -F "$g" "previous-window -t '$X:'" "send-keys M-k"
+  # M-j/M-k switch AND arm nav mode: follow-up bare j/k keep navigating,
+  # the next typing key falls back to the claude (vim: i to be explicit)
+  tmux bind -n M-j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav"     "send-keys M-j"
+  tmux bind -n M-k if -F "$g" "previous-window -t '$X:' ; switch-client -T hqnav" "send-keys M-k"
+  tmux bind -n M-Space if -F "$g" 'switch-client -T hqnav' 'send-keys M-Space'
   tmux bind -n M-h if -F "$g" 'select-pane -L'           "send-keys M-h"
   tmux bind -n M-l if -F "$g" 'select-pane -R'           "send-keys M-l"
   tmux bind -n M-n if -F "$g" "run-shell '$SELF newtab'" "send-keys M-n"
   for i in 1 2 3 4 5 6 7 8 9; do
     tmux bind -n "M-$i" if -F "$g" "run-shell '$SELF nth $i'" "send-keys M-$i"
+  done
+  # nav mode (sticky key table): bare vi keys, each one re-arms the table;
+  # any unbound key drops the client back to the root table = back to typing
+  tmux bind -T hqnav j "next-window -t '$X:' ; switch-client -T hqnav"
+  tmux bind -T hqnav k "previous-window -t '$X:' ; switch-client -T hqnav"
+  tmux bind -T hqnav g "select-window -t '$X:^' ; switch-client -T hqnav"
+  tmux bind -T hqnav G "select-window -t '$X:$' ; switch-client -T hqnav"
+  tmux bind -T hqnav n "run-shell '$SELF newtab'"
+  tmux bind -T hqnav h 'select-pane -L'
+  for i in 1 2 3 4 5 6 7 8 9; do
+    tmux bind -T hqnav "$i" "run-shell '$SELF nth $i' ; switch-client -T hqnav"
   done
 }
 
@@ -168,7 +183,7 @@ glyph() {  # $1 = pane id → hook-reported state, empty if hooks not wired
 is_robot() { [[ "$1" =~ ^[a-z]+-[0-9]{6}$ ]]; }
 
 declare -a tid tkind tname tpane tlabel
-sel=0 sel_id='' help=0 msg='' last_act=''
+sel=0 sel_id='' help=0 msg='' last_act='' nav=''
 
 scan() {
   tid=() tkind=() tname=() tpane=() tlabel=()
@@ -184,6 +199,7 @@ scan() {
     last_act=$cur_act
     sel_id=$cur_act
   fi
+  nav=$(tmux list-clients -t "=$S" -F '#{client_key_table}' 2>/dev/null | head -1)
   # select-window anywhere in hqx pokes us (C-l) for an instant bar update
   tmux set-hook -t "$X:" after-select-window \
     "run-shell \"tmux send-keys -t '$TMUX_PANE' C-l 2>/dev/null\"" 2>/dev/null
@@ -211,7 +227,8 @@ render() {
   local cw buf i line n=${#tid[@]}
   cw=$(tput cols 2>/dev/null || echo "$HQ_WIDTH")
   buf=$(
-    printf '%s[38;5;208;1mhq%s %s\n' "$E" "$R" "$(date -u +%H:%M:%SZ)"
+    printf '%s[38;5;208;1mhq%s %s%s\n' "$E" "$R" "$(date -u +%H:%M:%SZ)" \
+      "$([ "$nav" = hqnav ] && printf ' %s[1;38;5;226mnav%s' "$E" "$R")"
 
     hdr tabs
     (( n == 0 )) && printf '  none\n'
@@ -248,7 +265,7 @@ render() {
     done
 
     [ -n "$msg" ] && printf '\n  %s[38;5;196m%s%s\n' "$E" "$msg" "$R"
-    (( help )) && printf '\n%s[38;5;244m j/k gg G 1-9 move · enter/i type · n new\n x kill robot · r refresh · q detach\n M-j/k tabs · M-h/l panes · M-n new\n (M- keys work while typing)%s\n' "$E" "$R"
+    (( help )) && printf '\n%s[38;5;244m j/k gg G 1-9 move · enter/i type · n new\n x kill robot · r refresh · q detach\n M-j/k or M-Space arm nav mode: bare\n j/k g G 1-9 switch tabs, i to type%s\n' "$E" "$R"
   )
   printf '%s[H%s[2J%s\n' "$E" "$E" "$buf"
 }
