@@ -110,12 +110,24 @@ switch, and `C-b o` flips to the full-screen board and back. attach from
 a phone and it just happens; back on a wide terminal it un-zooms itself.
 `HQ_NARROW=0` forces the split everywhere.
 
-## exit / restart
+## in / out / restart
 
-everything is detach, nothing needs killing: `q` on the board or plain
-`C-b d` leaves all claudes and robots running — `hq` re-attaches. ctrl-c
-in the right pane goes to the claude you're looking at, not to hq.
-`hq restart` rebuilds the board + viewer (claudes untouched).
+hq lives on your existing tmux server — no second attach, no separate
+terminal. your claudes stay in their own sessions; hq is a viewport over
+all of them.
+
+```
+M-q          toggle: hq from anywhere <-> back where you were
+             (no alt? C-b Tab does the same)
+q  (board)   leave hq, back to your previous session
+C-b d        detach from tmux entirely — everything keeps running
+hq           from any shell: build if needed + enter
+hq restart   rebuild board + viewer; claudes untouched
+hq kill      remove hq's sessions. adopted claudes survive in their
+             home sessions; hq-native tabs and live robot runs die
+```
+
+ctrl-c in the right pane goes to the claude you're looking at, not to hq.
 
 ## robots
 

@@ -55,12 +55,15 @@ binds() {  # root-table keys, live even while typing in a claude. if-shell
   # everywhere else. HQ_BINDS=0 in hqrc removes them.
   local g="#{==:#{session_name},$S}" i
   if [ "${HQ_BINDS:-1}" != 1 ]; then
-    for i in j k h l n Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
+    for i in j k h l n q Space 1 2 3 4 5 6 7 8 9; do tmux unbind -n "M-$i" 2>/dev/null; done
     tmux unbind -a -T hqnav 2>/dev/null
-    tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null
+    tmux unbind j 2>/dev/null; tmux unbind k 2>/dev/null; tmux unbind Tab 2>/dev/null
     tmux bind Space next-layout   # restore stock prefix-Space
     return 0
   fi
+  # the front door: M-q (phone: C-b Tab) toggles hq <-> wherever you were
+  tmux bind -n M-q if -F "$g" 'switch-client -l' "switch-client -t '=$S'"
+  tmux bind Tab if -F "$g" 'switch-client -l' "switch-client -t '=$S'"
   # M-j/M-k switch AND arm nav mode: follow-up bare j/k keep navigating,
   # the next typing key falls back to the claude (vim: i to be explicit)
   tmux bind -n M-j if -F "$g" "next-window -t '$X:' ; switch-client -T hqnav"     "send-keys M-j"
@@ -514,7 +517,8 @@ render() {
   [ -n "$msg" ] && buf+=$'\n'"  ${E}[38;5;196m$msg${R}"$'\n'
   if (( help )); then
     buf+=$'\n'"${E}[38;5;244m j/k gg G 1-9 move · enter/i type · n new"$'\n'
-    buf+=' x kill robot · r refresh · q detach'$'\n'
+    buf+=' x kill robot · r refresh · q leave'$'\n'
+    buf+=' M-q (C-b Tab) toggles hq in/out'$'\n'
     buf+=' M-j/k or M-Space arm nav mode: bare'$'\n'
     buf+=" j/k g G 1-9 switch tabs, i to type${R}"$'\n'
   fi
@@ -591,7 +595,11 @@ handle() {
        scan; render ;;
     x) killtab ;;
     r) flush; scan; runs_scan; poll_scan; render ;;
-    q) tmux detach-client -s "=$S" 2>/dev/null ;;
+    q) local c ok=''   # back to the session you came from; detach if none
+       for c in $(tmux list-clients -t "=$S" -F '#{client_name}' 2>/dev/null); do
+         tmux switch-client -c "$c" -l 2>/dev/null && ok=1
+       done
+       [ -n "$ok" ] || tmux detach-client -s "=$S" 2>/dev/null ;;
     '?') help=$(( 1 - help )); render ;;
   esac
   return 0
@@ -631,6 +639,12 @@ case "${1:-}" in
   restart)  # rebuild board + viewer; claudes (hqx) untouched
     tmux kill-session -t "=$S" 2>/dev/null
     exec "$SELF" ;;
+  kill)  # full teardown: ui first (else the viewer loop resurrects hqx),
+    # then hqx. adopted claudes survive in their home sessions; hq-native
+    # tabs and live robot runs die with hqx. timers keep polling headless.
+    tmux kill-session -t "=$S" 2>/dev/null
+    tmux kill-session -t "=$X" 2>/dev/null
+    echo 'hq: gone (adopted claudes live on in their own sessions)' ;;
   '')
     migrate
     ensure
@@ -659,5 +673,5 @@ case "${1:-}" in
     fi
     echo "hq: sessions ready (no tty — attach with: tmux attach -t $S)"
     ;;
-  *) echo 'usage: hq [restart|board|view|hooks|newtab|nth N]' >&2; exit 2 ;;
+  *) echo 'usage: hq [restart|kill|board|view|hooks|newtab|nth N]' >&2; exit 2 ;;
 esac
