@@ -1,11 +1,40 @@
 #!/bin/bash
 # hq-status <working|waiting|done|gone> — claude code hook helper. paints the
-# tmux tab this session lives in: sets the window's @hqstate option, which
-# window-status-format colours (see `hq hooks`). also records the state per
-# pane so `hq bar` can reconcile. always exits 0 — a hook must never block a
-# tool call, and it runs on every one of them, so it does nothing at all when
-# the state hasn't changed.
+# tmux tab this session lives in: green while it works, yellow when the turn is
+# yours (bold if it is blocked on a prompt). also records the state per pane so
+# `hq bar` can reconcile. always exits 0 — a hook must never block a tool call,
+# and it runs on every one of them, so it does nothing at all when the state
+# hasn't changed.
 set -u
+
+# paint <target> <state> — the whole palette, in one place.
+#
+# The colour goes on the window's own window-status-style, NOT on a @hqstate
+# read from window-status-format: user options do not resolve during status
+# rendering (tmux 3.7 — `display -p` resolves @hqstate fine, the status line
+# expands it to empty), which is why the conditional format painted nothing.
+paint() {
+  local t="$1" style
+  case "$2" in
+    working) style='fg=green' ;;
+    waiting) style='fg=yellow,bold' ;;
+    done)    style='fg=yellow' ;;
+    *)
+      tmux set -w -t "$t" -u window-status-style 2>/dev/null
+      tmux set -w -t "$t" -u window-status-current-style 2>/dev/null
+      return 0 ;;
+  esac
+  tmux set -w -t "$t" window-status-style "$style" 2>/dev/null
+  tmux set -w -t "$t" window-status-current-style "$style" 2>/dev/null
+}
+
+# `hq bar` reconciles tabs whose claude died without firing SessionEnd, and it
+# already knows the state — it borrows the palette rather than copying it.
+# Before the stdin read below: nothing pipes into this call, and cat would hang.
+if [ "${1:-}" = paint ]; then
+  paint "${2:-}" "${3:-none}"
+  exit 0
+fi
 
 d="${XDG_RUNTIME_DIR:-/tmp}/hq/state"
 p="${TMUX_PANE:-}"
@@ -18,6 +47,7 @@ case "$ev" in
   gone)
     rm -f "$d/$p"
     tmux set -w -t "$p" -u @hqstate 2>/dev/null
+    paint "$p" none
     tmux refresh-client -S 2>/dev/null
     exit 0 ;;
   working|waiting) ;;
@@ -34,6 +64,7 @@ printf '%s %s\n' "$ev" "$(date -u +%FT%TZ)" > "$d/$p" 2>/dev/null
 [ "$prev" = "$ev" ] && exit 0
 
 tmux set -w -t "$p" @hqstate "$ev" 2>/dev/null
+paint "$p" "$ev"
 tmux refresh-client -S 2>/dev/null
 
 # a robot stuck on a prompt is a stalled unattended run — surface it

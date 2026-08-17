@@ -85,14 +85,20 @@ hooks() {
   # for robot panes is the tmux server's — ~/.local/bin may not be on it
   local hs c
   hs="$(dirname "$SELF")/hq-status"
-  # NB: styles inside a #{?...} conditional must be space-separated
-  # (#[fg=yellow bold]) — a comma there is read as the conditional's separator
-  c='#{?#{==:#{@hqstate},waiting},#[fg=yellow bold],}#{?#{==:#{@hqstate},working},#[fg=green],}#I:#W#{?window_flags,#{window_flags}, }#[default]'
+  # Plain: the colour is a per-window window-status-style set by hq-status, not
+  # a conditional on @hqstate — user options expand to empty while the status
+  # line renders, so a format that reads them paints nothing (tmux 3.7).
+  c='#I:#W#{?window_flags,#{window_flags}, }'
+  # SessionStart paints a brand-new tab yellow — it is waiting on you before you
+  # have typed anything. No matcher: `"matcher": "startup|resume|clear"` never
+  # fires (claude code does not treat it as an alternation), so the one source
+  # that must NOT repaint — a compaction mid-turn — is filtered from the payload.
   cat <<EOF
 1. merge into ~/.claude/settings.json:
 
 {
   "hooks": {
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "jq -e '.source != \\"compact\\"' >/dev/null 2>&1 && $hs waiting </dev/null; true" }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "$hs working" }] }],
     "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "$hs working" }] }],
     "Notification":     [{ "hooks": [{ "type": "command", "command": "$hs waiting" }] }],
@@ -153,6 +159,7 @@ bar() {
     [ "$want" = "${CUR[$wid]}" ] && continue
     if [ -n "$want" ]; then tmux set -w -t "$wid" @hqstate "$want" 2>/dev/null
     else tmux set -w -t "$wid" -u @hqstate 2>/dev/null; fi
+    "$(dirname "$SELF")/hq-status" paint "$wid" "${want:-none}"
   done
   # tmux reads job output line-wise — a missing newline means it never appears
   (( maxpct >= 80 )) && printf '#[fg=red]%s%%#[default] \n' "$maxpct"

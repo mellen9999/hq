@@ -33,9 +33,12 @@ PATH.
 
 ## how it works
 
-the hooks fire on state changes and set a per-window tmux option
-(`@hqstate`), which `window-status-format` colours. no polling, no daemon —
-the tab is already the right colour by the time you look at it. the hook
+the hooks fire on state changes and set that window's own
+`window-status-style`, plus an `@hqstate` option other tools can read. no
+polling, no daemon — the tab is already the right colour by the time you
+look at it. the style has to live on the window rather than in a
+`window-status-format` conditional: user options expand to empty while the
+status line renders, so a format that reads `@hqstate` paints nothing. the hook
 does nothing at all when the state hasn't moved, which matters because
 `PreToolUse` runs on every single tool call.
 
