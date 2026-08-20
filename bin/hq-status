@@ -13,6 +13,11 @@ set -u
 # read from window-status-format: user options do not resolve during status
 # rendering (tmux 3.7 — `display -p` resolves @hqstate fine, the status line
 # expands it to empty), which is why the conditional format painted nothing.
+# @hqstate is written here and nowhere else, together with the colour it
+# stands for. They used to be set by separate callers, and `hq bar` reconciles
+# a tab by comparing @hqstate against what it should be — so any drift between
+# the two left a colour painted on a tab the janitor believed was already
+# clean, permanently. One writer, one invariant.
 paint() {
   local t="$1" style
   case "$2" in
@@ -20,10 +25,12 @@ paint() {
     waiting) style='fg=yellow,bold' ;;
     done)    style='fg=yellow' ;;
     *)
+      tmux set -w -t "$t" -u @hqstate 2>/dev/null
       tmux set -w -t "$t" -u window-status-style 2>/dev/null
       tmux set -w -t "$t" -u window-status-current-style 2>/dev/null
       return 0 ;;
   esac
+  tmux set -w -t "$t" @hqstate "$2" 2>/dev/null
   tmux set -w -t "$t" window-status-style "$style" 2>/dev/null
   tmux set -w -t "$t" window-status-current-style "$style" 2>/dev/null
 }
@@ -46,7 +53,6 @@ mkdir -p "$d" 2>/dev/null || exit 0
 case "$ev" in
   gone)
     rm -f "$d/$p"
-    tmux set -w -t "$p" -u @hqstate 2>/dev/null
     paint "$p" none
     tmux refresh-client -S 2>/dev/null
     exit 0 ;;
@@ -63,7 +69,6 @@ read -r prev _ < "$d/$p" 2>/dev/null || prev=''
 printf '%s %s\n' "$ev" "$(date -u +%FT%TZ)" > "$d/$p" 2>/dev/null
 [ "$prev" = "$ev" ] && exit 0
 
-tmux set -w -t "$p" @hqstate "$ev" 2>/dev/null
 paint "$p" "$ev"
 tmux refresh-client -S 2>/dev/null
 

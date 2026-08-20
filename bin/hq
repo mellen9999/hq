@@ -22,9 +22,23 @@ RUN="${XDG_RUNTIME_DIR:-/tmp}/hq"
 STATED="$RUN/state"
 SELF=$(realpath "$0")
 
-# claude either owns the tty (cmd=claude) or sits behind a wrapper shell —
-# then its title glyph (✳ / braille spinner) gives it away
-is_claude() { case "$1:$2" in claude:*|*:✳*|*:[⠀-⣿]*) return 0 ;; esac; return 1; }
+# Which ttys have a live claude on them → g_ttys, plus g_ps as proof the
+# process table was actually readable.
+#
+# Neither of the obvious tells survives: a claude behind `claude; exec bash`
+# reports pane_current_command=bash, and the pane title's spinner glyph is not
+# a stable contract — claude code moved from braille to ◐◑◒◓ and every tab with
+# a working claude silently lost its colour, because bar() read those panes as
+# "not claude" and repainted them clean within one status interval. One `ps`
+# pass costs about as much as the glyph guess and cannot drift.
+claude_ttys() {
+  local t c
+  g_ttys=(); g_ps=''
+  while read -r t c; do
+    g_ps=1
+    [ "$c" = claude ] && [ "$t" != '?' ] && g_ttys["/dev/$t"]=1
+  done < <(ps -eo tty=,comm= 2>/dev/null)
+}
 
 ctx_max() {  # $1 model → g_cm context window; HQ_CTX covers unknown models
   case $1 in
@@ -121,19 +135,26 @@ EOF
 # comfortable. it doubles as the janitor for tabs whose claude died without
 # firing SessionEnd.
 bar() {
-  local sess wid pid cmd path title state m c g_state g_tf g_cm
+  local sess wid pid tty path title state m c g_state g_tf g_cm g_ps
   local maxpct=0 want
   local now=$EPOCHSECONDS cache="$RUN/bar" cts=0 pane pct
-  local -A CPCT=() WANT=() CUR=()
+  local -A CPCT=() WANT=() CUR=() g_ttys=()
+  # No process table means no idea what is alive — leave every tab exactly as
+  # it is rather than reconciling them all to "not claude".
+  claude_ttys
+  [ -n "$g_ps" ] || return 0
   [ -r "$cache" ] && { read -r cts; while read -r pane pct; do CPCT[$pane]=$pct; done; } < "$cache"
   local fresh=1
   (( now - cts > HQ_BAR_TTL )) && fresh=''
-  while IFS='|' read -r sess wid pid cmd path title state; do
+  while IFS='|' read -r sess wid pid tty path title state; do
     [ -n "${CUR[$wid]+x}" ] || CUR[$wid]=$state
     [ "$sess" = "$X" ] && continue          # robots aren't tabs of yours
-    is_claude "$cmd" "$title" || continue
+    [ -n "${g_ttys[$tty]+x}" ] || continue
     pane_state "$pid"
-    case $g_state in waiting|working) WANT[$wid]=$g_state ;; *) WANT[$wid]='' ;; esac
+    # `done` belongs here too: a claude that has finished its turn is yellow,
+    # and leaving it out made bar() strip that yellow within one status
+    # interval — the state you most want to see was the one that never stuck.
+    case $g_state in waiting|working|done) WANT[$wid]=$g_state ;; *) WANT[$wid]='' ;; esac
     if [ -n "$fresh" ]; then
       pct=${CPCT[$pid]:-0}
     else
@@ -147,7 +168,7 @@ bar() {
       CPCT[$pid]=$pct
     fi
     (( pct > maxpct )) && maxpct=$pct
-  done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_title}|#{@hqstate}' 2>/dev/null)
+  done < <(tmux list-panes -a -F '#{session_name}|#{window_id}|#{pane_id}|#{pane_tty}|#{pane_current_path}|#{pane_title}|#{@hqstate}' 2>/dev/null)
   if [ -z "$fresh" ]; then
     mkdir -p "$RUN" 2>/dev/null
     { echo "$now"; for pane in "${!CPCT[@]}"; do echo "$pane ${CPCT[$pane]}"; done; } > "$cache" 2>/dev/null
@@ -157,8 +178,6 @@ bar() {
   for wid in "${!CUR[@]}"; do
     want=${WANT[$wid]:-}
     [ "$want" = "${CUR[$wid]}" ] && continue
-    if [ -n "$want" ]; then tmux set -w -t "$wid" @hqstate "$want" 2>/dev/null
-    else tmux set -w -t "$wid" -u @hqstate 2>/dev/null; fi
     "$(dirname "$SELF")/hq-status" paint "$wid" "${want:-none}"
   done
   # tmux reads job output line-wise — a missing newline means it never appears

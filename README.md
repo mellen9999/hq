@@ -95,9 +95,16 @@ tmux and claude-transcript traps this walks around, for the next person:
   that way. verify by a side effect (a file the command touches) instead.
 - **a `#()` job needs a trailing newline** — tmux reads job output
   line-wise, so `printf '%s'` with no `\n` shows up as nothing.
-- **`pane_current_command` reports the wrapper shell**, not the child, so
-  a claude behind `claude; exec bash` reads as `bash` — the pane title's
-  spinner glyph is the reliable tell.
+- **nothing on the pane tells you a claude is there.**
+  `pane_current_command` reports the wrapper shell, so a claude behind
+  `claude; exec bash` reads as `bash`; the pane title's spinner glyph looks
+  like the tell, but it is claude code's to change and it did — braille to
+  `◐◑◒◓` — after which every working tab lost its colour within one status
+  interval, because the janitor read those panes as "not claude" and
+  cleaned them. `ps -eo tty=,comm=`, matched against `#{pane_tty}`, is one
+  pass for the whole server and cannot drift. If `ps` gives nothing back,
+  repaint nothing: an unreadable process table is not evidence that every
+  session died.
 - **`unlink-window -t @22` unlinks from whichever session tmux resolves
   first**, not the one you meant. always name it: `unlink-window -t
   hqx:@22`.
